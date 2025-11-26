@@ -1,0 +1,276 @@
+[
+    {
+        "id": "seismic_flow_group",
+        "type": "tab",
+        "label": "Sistem Seismik 433MHz",
+        "disabled": true,
+        "info": ""
+    },
+    {
+        "id": "mqtt_in_dragino",
+        "type": "mqtt in",
+        "z": "seismic_flow_group",
+        "name": "Dari Dragino (Uplink)",
+        "topic": "seismic/uplink/#",
+        "qos": "0",
+        "datatype": "auto-detect",
+        "broker": "7133eb1048b04587",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 140,
+        "y": 160,
+        "wires": [
+            [
+                "logic_router"
+            ]
+        ]
+    },
+    {
+        "id": "logic_router",
+        "type": "function",
+        "z": "seismic_flow_group",
+        "name": "Router: Teks vs Biner",
+        "func": "// KODE AKHIR: LOGIC MANAGER (Hex Decoding, Header Stripping, Buffer Output)\n// Delay 1200ms (Disesuaikan dengan nilai optimal Anda)\n\nvar payload = msg.payload;\n\n// Cek apakah payload berupa String Hex atau Buffer\nif (typeof payload === 'string' || Buffer.isBuffer(payload)) {\n\n    // --- 1. DECODING STRING HEX KE ASCII & BUFFER ---\n    var strHex = (typeof payload === 'string') ? payload : payload.toString('hex');\n    var rawBuffer; // Variabel untuk menyimpan data biner murni\n\n    try {\n        rawBuffer = Buffer.from(strHex, 'hex');\n        var decodedStr = rawBuffer.toString('ascii');\n    } catch (e) {\n        node.warn(\"Decoding Error: Payload is not a valid Hex string.\");\n        return null;\n    }\n\n    // --- 2. PEMOTONGAN HEADER DRAGINO (Filter Metadata) ---\n    var lastCommaIndex = decodedStr.lastIndexOf(',');\n    var str; // String bersih (tanpa header tanggal/RSSI)\n    \n    if (lastCommaIndex === -1) {\n        str = decodedStr.trim();\n    } else {\n        str = decodedStr.substring(lastCommaIndex + 1).trim();\n    }\n\n    // ----------------------------------------------------\n    // JALUR 3: PARSING LOGIKA WEMOS\n    // ----------------------------------------------------\n\n    // A. Parsing VCC & Status Handshake\n    if (str.includes(\"stat=TIME_REQ\") || str.includes(\"stat=POLL\")) {\n\n        // A.1. Parsing VCC/Baterai\n        if (str.includes(\"sys=\")) {\n            var parts = str.split(\"&\");\n            var sysPart = parts.find(el => el.startsWith(\"sys=\"));\n            if (sysPart) {\n                var voltage = parseInt(sysPart.split(\"=\")[1]);\n                // Output 1: Data Baterai (TANPA DELAY)\n                node.send([{ payload: voltage, topic: \"sys_voltage\" }, null, null]);\n            }\n        }\n\n        // A.2. HANDSHAKE WAKTU (TIME_REQ)\n        if (str.includes(\"stat=TIME_REQ\")) {\n            var now = Math.floor(Date.now() / 1000);\n\n            // --- IMPLEMENTASI DELAY 1200 MS (Sesuai Kalibrasi Anda) ---\n            var timeMsg = { payload: \"TIME:\" + now, topic: \"seismic/downlink\" };\n\n            setTimeout(function () {\n                // Output 3: Balasan Waktu\n                node.send([null, null, timeMsg]);\n            }, 1200); \n        }\n\n        // A.3. CEK TUGAS (POLL)\n        if (str.includes(\"stat=POLL\")) {\n            var mode = flow.get(\"command_status\") || \"STOP\";\n            if (mode === \"REQ_ACQ\") {\n                // Output 3: Kirim perintah ACQ\n                node.send([null, null, { payload: \"ACQ_START\", topic: \"seismic/downlink\" }]);\n            }\n        }\n    }\n\n    // B. JALUR BINARY SEISMIK (FETCH)\n    // Syarat: Payload panjang DAN tidak mengandung keyword status\n    else if (payload.length > 50 && !str.includes(\"stat=\")) {\n        \n        // *** PERBAIKAN PENTING ***\n        // Kita ganti payload dengan rawBuffer agar Binary Parser menerima BUFFER, bukan String Hex.\n        msg.payload = rawBuffer; \n        \n        // Output 2: Data Seismik Biner (Buffer)\n        return [null, msg, null];\n    }\n}\n\n// Penting: Kembalikan null karena kita menggunakan node.send() asinkron di dalam setTimeout.\nreturn null;",
+        "outputs": 3,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 420,
+        "y": 160,
+        "wires": [
+            [
+                "gauge_voltage",
+                "debug_status"
+            ],
+            [
+                "binary_parser"
+            ],
+            [
+                "mqtt_out_dragino",
+                "debug_cmd"
+            ]
+        ]
+    },
+    {
+        "id": "binary_parser",
+        "type": "function",
+        "z": "seismic_flow_group",
+        "name": "Decoder Data Biner",
+        "func": "// Function: Binary Parser (Sequence Alignment & Decoding)\n// Tugas: Membuang Header & Sequence Number, lalu decode Int16\n\nvar buf = msg.payload;\n\n// 1. Validasi Input\n// Data harus berupa Buffer.\n// Panjang minimal harus > 4 byte (3 byte Header \"<1>\" + 1 byte Seq + minimal 2 byte Data)\nif (!Buffer.isBuffer(buf) || buf.length <= 4) {\n    // Abaikan paket yang rusak atau terlalu pendek\n    return null;\n}\n\n// 2. Ekstrak Metadata (Opsional, untuk Debugging)\n// Struktur Paket Wemos: [ '<', '1', '>', SEQ, DATA... ]\n// Byte ke-3 (index 3) adalah Sequence Number (0-255)\nvar packetSequence = buf[3];\n\n// 3. Isolasi Data Seismik\n// Kita membuang 4 byte pertama (Header ID + Sequence Number)\n// Data murni dimulai dari index 4 sampai akhir buffer.\nvar seismicData = buf.slice(4);\n\nvar points = [];\n\n// 4. Decoding Data (Buffer -> Array of Integers)\n// Loop setiap 2 byte karena ADS1115 mengirim data 16-bit (Int16)\nfor (var i = 0; i < seismicData.length; i += 2) {\n    // Pastikan masih ada 2 byte tersisa untuk dibaca\n    if (i + 1 < seismicData.length) {\n        // Baca Signed Integer 16-bit dengan format Little Endian\n        // (Sesuai arsitektur Wemos ESP8266)\n        var val = seismicData.readInt16LE(i);\n        \n        // Masukkan nilai ke dalam array\n        points.push(val);\n    }\n}\n\n// 5. Output ke Chart\n// Mengirim array penuh agar Chart Node memplotnya sebagai garis yang mulus\nmsg.payload = points;\n\n// (Opsional) Menempelkan info sequence number ke pesan jika ingin di-debug di simpul lain\nmsg.packet_seq = packetSequence; \n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 160,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "mqtt_out_dragino",
+        "type": "mqtt out",
+        "z": "seismic_flow_group",
+        "name": "Ke Dragino (Downlink)",
+        "topic": "seismic/downlink",
+        "qos": "2",
+        "retain": "",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "7133eb1048b04587",
+        "x": 740,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "switch_acq",
+        "type": "ui_switch",
+        "z": "seismic_flow_group",
+        "name": "Switch Akuisisi",
+        "label": "Mode Akuisisi",
+        "tooltip": "",
+        "group": "ui_group_seismic",
+        "order": 0,
+        "width": 0,
+        "height": 0,
+        "passthru": true,
+        "decouple": "false",
+        "topic": "control",
+        "topicType": "str",
+        "style": "",
+        "onvalue": "REQ_ACQ",
+        "onvalueType": "str",
+        "onicon": "",
+        "oncolor": "",
+        "offvalue": "STOP",
+        "offvalueType": "str",
+        "officon": "",
+        "offcolor": "",
+        "animate": false,
+        "className": "",
+        "x": 160,
+        "y": 80,
+        "wires": [
+            [
+                "change_flow_status"
+            ]
+        ]
+    },
+    {
+        "id": "change_flow_status",
+        "type": "change",
+        "z": "seismic_flow_group",
+        "name": "Set Flow Var",
+        "rules": [
+            {
+                "t": "change",
+                "p": "command_status",
+                "pt": "flow",
+                "from": "true",
+                "fromt": "bool",
+                "to": "REQ_ACQ",
+                "tot": "str"
+            },
+            {
+                "t": "change",
+                "p": "command_status",
+                "pt": "flow",
+                "from": "false",
+                "fromt": "bool",
+                "to": "STOP",
+                "tot": "str"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 410,
+        "y": 80,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "gauge_voltage",
+        "type": "ui_gauge",
+        "z": "seismic_flow_group",
+        "name": "Voltase Sistem",
+        "group": "ui_group_seismic",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "gtype": "gage",
+        "title": "Baterai / VCC",
+        "label": "mV",
+        "format": "{{value}}",
+        "min": "2800",
+        "max": "3500",
+        "colors": [
+            "#ca3838",
+            "#e6e600",
+            "#55c03c"
+        ],
+        "seg1": "",
+        "seg2": "",
+        "diff": false,
+        "className": "",
+        "x": 720,
+        "y": 60,
+        "wires": []
+    },
+    {
+        "id": "debug_status",
+        "type": "debug",
+        "z": "seismic_flow_group",
+        "name": "Debug Status",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 720,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "debug_cmd",
+        "type": "debug",
+        "z": "seismic_flow_group",
+        "name": "Debug Command",
+        "active": true,
+        "tosidebar": true,
+        "console": true,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload",
+        "statusType": "auto",
+        "x": 740,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "7133eb1048b04587",
+        "type": "mqtt-broker",
+        "name": "Local Broker",
+        "broker": "mosquitto",
+        "port": 1883,
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "ui_group_seismic",
+        "type": "ui_group",
+        "name": "Kontrol Seismik",
+        "tab": "",
+        "order": 1,
+        "disp": true,
+        "width": "6",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "e69ba5c302dcf60f",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6"
+        }
+    }
+]

@@ -1,0 +1,1104 @@
+[
+    {
+        "id": "45a002da4b6da150",
+        "type": "tab",
+        "label": "MESUR SYSTEM",
+        "disabled": false,
+        "info": "Sistem Monitoring Seismik IoT Final v2.0\n- Fixed Syntax Errors\n- Multi-Node Support\n- Master-Detail View"
+    },
+    {
+        "id": "b0df159daeb82ac6",
+        "type": "inject",
+        "z": "45a002da4b6da150",
+        "name": "Init on Boot",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "0.1",
+        "topic": "",
+        "payload": "{}",
+        "payloadType": "json",
+        "x": 130,
+        "y": 80,
+        "wires": [
+            [
+                "88596b1d89f3e738"
+            ]
+        ]
+    },
+    {
+        "id": "88596b1d89f3e738",
+        "type": "change",
+        "z": "45a002da4b6da150",
+        "name": "Reset Globals",
+        "rules": [
+            {
+                "t": "set",
+                "p": "seiscatch_status",
+                "pt": "global",
+                "to": "{}",
+                "tot": "json"
+            },
+            {
+                "t": "set",
+                "p": "global_command",
+                "pt": "global",
+                "to": "STOP",
+                "tot": "str"
+            },
+            {
+                "t": "set",
+                "p": "plot_mode",
+                "pt": "flow",
+                "to": "TIME",
+                "tot": "str"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 320,
+        "y": 80,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "5a549018b4207da5",
+        "type": "mqtt in",
+        "z": "45a002da4b6da150",
+        "name": "Uplink (Wildcard)",
+        "topic": "seismic/uplink/#",
+        "qos": "0",
+        "datatype": "auto",
+        "broker": "brk_mosquitto",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 100,
+        "y": 200,
+        "wires": [
+            [
+                "321a33cbad7986d7"
+            ]
+        ]
+    },
+    {
+        "id": "321a33cbad7986d7",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Logic Core (Router)",
+        "func": "// LOGIC CORE FINAL (Fix: Input Handling)\nvar payload = msg.payload;\nvar topicParts = msg.topic.split('/');\nvar nodeID = topicParts[topicParts.length - 1]; \nif (!nodeID || nodeID === \"uplink\") nodeID = \"001\";\n\n// --- 1. SMART INPUT HANDLING (FIX PENTING) ---\n// Tujuan: Mendapatkan representasi STRING HEX dari data yang masuk\nvar strHex = \"\";\nvar strText = \"\";\n\nif (Buffer.isBuffer(payload)) {\n    // Jika Buffer, konversi ke Hex untuk analisis seismik\n    strHex = payload.toString('hex');\n    // Dan konversi ke ASCII untuk analisis status\n    strText = payload.toString('utf8');\n} else if (typeof payload === 'string') {\n    // Jika String, anggap itu adalah Hex (karena Dragino mengirim teks hex \"0030...\")\n    strHex = payload.trim();\n    // Untuk status, kita coba baca langsung (kadang Dragino kirim \"stat=...\" langsung)\n    strText = payload.trim();\n}\n\n// --- 2. INIT GLOBAL STATUS ---\nvar statusMap = global.get('seiscatch_status') || {};\nif (!statusMap[nodeID]) {\n    statusMap[nodeID] = { vcc: 0, status: \"Online\", time: Date.now(), id: nodeID };\n}\n\n// ==========================================\n// JALUR A: DATA STATUS (TEKS)\n// Cek pada strText (versi ASCII)\n// ==========================================\nif (strText.includes(\"stat=\") || strText.includes(\"sys=\")) {\n    \n    // Bersihkan sisa header jika ada\n    var cleanStr = strText.replace(/<\\d+>/, \"\");\n\n    if (cleanStr.includes(\"sys=\")) {\n        var parts = cleanStr.split('&');\n        var sysPart = parts.find(p => p.startsWith(\"sys=\"));\n        if (sysPart) statusMap[nodeID].vcc = parseInt(sysPart.split('=')[1]);\n        statusMap[nodeID].status = \"Idle / Polling\";\n    }\n    statusMap[nodeID].time = Date.now();\n\n    if (cleanStr.includes(\"TIME_REQ\")) {\n        var now = Math.floor(Date.now() / 1000);\n        setTimeout(function() {\n            node.send([null, null, { payload: \"TIME:\" + now, topic: \"seismic/downlink\" }]);\n        }, 1200); \n        statusMap[nodeID].status = \"Syncing Time\";\n    }\n\n    if (cleanStr.includes(\"POLL\")) {\n        var cmd = global.get('global_command') || \"STOP\";\n        if (cmd === \"REQ_ACQ\") {\n            setTimeout(function() {\n                node.send([null, null, { payload: \"ACQ_START\", topic: \"seismic/downlink\" }]);\n            }, 1200);\n            statusMap[nodeID].status = \"Starting Acquisition\";\n        }\n    }\n    \n    global.set('seiscatch_status', statusMap);\n    node.send([{ payload: statusMap }, null, null]);\n}\n\n// ==========================================\n// JALUR B: DATA SEISMIK (HEX STRING)\n// Cek pada strHex (versi Hexadecimal)\n// ==========================================\n// Data: \"00300050...\" -> Panjang > 20 dan BUKAN status\nelse if (strHex.length > 20 && !strText.includes(\"stat=\")) {\n    \n    statusMap[nodeID].status = \"Receiving Data\";\n    statusMap[nodeID].time = Date.now();\n    global.set('seiscatch_status', statusMap);\n    node.send([{ payload: statusMap }, null, null]);\n\n    try {\n        // Konversi Hex String kembali ke Buffer Biner\n        // \"0030...\" -> <Buffer 00 30 ...>\n        var dataBuffer = Buffer.from(strHex, 'hex');\n        \n        // Kirim Buffer ke Binary Parser\n        // Buffer[0] adalah Sequence Number (sesuai log Anda)\n        var msgBiner = { payload: dataBuffer, topic: nodeID };\n        node.send([null, msgBiner, null]);\n    } catch(e) {\n        return null;\n    }\n}\n\nreturn null;",
+        "outputs": 3,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 360,
+        "y": 200,
+        "wires": [
+            [
+                "4c2d454c70fc6091"
+            ],
+            [
+                "80c29e41c82ed4e1"
+            ],
+            [
+                "67380d952504cb13"
+            ]
+        ]
+    },
+    {
+        "id": "80c29e41c82ed4e1",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Binary Parser (Int16)",
+        "func": "// BINARY PARSER (Input: Buffer [Seq, Data...])\nvar buf = msg.payload;\nvar nodeID = msg.topic;\n\nif (!Buffer.isBuffer(buf) || buf.length < 2) return null;\n\n// 1. Ambil Sequence (Byte ke-0)\nvar seqNum = buf[0];\n\n// 2. Ambil Data Seismik (Skip 1 byte Seq)\n// Log Anda menunjukkan data langsung dimulai setelah seq 00.\nvar seismicData = buf.slice(1); \n\nvar points = [];\n\n// 3. Decoding\nfor (var i = 0; i < seismicData.length; i += 2) {\n    if (i + 1 < seismicData.length) {\n        var val = seismicData.readInt16LE(i);\n        points.push(val);\n    }\n}\n\nmsg.payload = points;\nmsg.topic = nodeID;\nmsg.packet_seq = seqNum;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 260,
+        "wires": [
+            [
+                "1270a57fdf0d86cf",
+                "cd5118252fe9e3ae"
+            ]
+        ]
+    },
+    {
+        "id": "cd5118252fe9e3ae",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Dispatcher (Filter)",
+        "func": "// DISPATCHER FINAL (Corrected for Global Mode & Array Passing)\n\n// 1. Filter Node ID\nvar selectedNode = global.get('selected_view_node');\n// Jika node ini bukan yang dipilih, stop.\nif (msg.topic !== selectedNode && selectedNode) return null;\n\n// 2. Cek Mode (BACA DARI GLOBAL)\nvar mode = global.get('plot_mode') || \"TIME\";\n\n// Debugging: Cek di tab debug jika mode tidak berubah\n// node.warn(\"Dispatcher Current Mode: \" + mode);\n\nif (mode === \"TIME\") {\n    // JALUR TIME SERIES\n    // Kirim Array Utuh ke Output 1 (Ke Chart Formatter)\n    // Jangan di-loop! Chart.js butuh array sekaligus.\n    return [msg, null]; \n}\nelse if (mode === \"FFT\") {\n    // JALUR FFT\n    // Kirim Array Utuh ke Output 2 (Ke Python)\n    return [null, msg];\n}\n\nreturn null;",
+        "outputs": 2,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 930,
+        "y": 320,
+        "wires": [
+            [
+                "c8a8a4765d854f55"
+            ],
+            [
+                "0c86e2398042c50b"
+            ]
+        ]
+    },
+    {
+        "id": "0c86e2398042c50b",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "To JSON",
+        "func": "msg.payload = JSON.stringify(msg.payload);\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1060,
+        "y": 380,
+        "wires": [
+            [
+                "91a8ce20a680dbfe"
+            ]
+        ]
+    },
+    {
+        "id": "91a8ce20a680dbfe",
+        "type": "exec",
+        "z": "45a002da4b6da150",
+        "command": "python3 /data/seismic_calc.py",
+        "addpay": "payload",
+        "append": "",
+        "useSpawn": "false",
+        "timer": "",
+        "winHide": false,
+        "oldrc": false,
+        "name": "Run Python (FFT)",
+        "x": 1250,
+        "y": 380,
+        "wires": [
+            [
+                "d2aa8fe8417a22eb"
+            ],
+            [],
+            []
+        ]
+    },
+    {
+        "id": "d2aa8fe8417a22eb",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Parse FFT",
+        "func": "// Parse FFT (Re-Wrapped for Chart Reset)\ntry {\n    var result = JSON.parse(msg.payload);\n    if (result.fft) {\n        // PENTING: Bungkus dalam array lagi [ result.fft ]\n        // Ini memberitahu Chart: \"Ini adalah Seri 1, HAPUS data lama, ganti dengan ini\"\n        msg.payload = [ result.fft ]; \n        \n        msg.topic = \"Frequency Spectrum\";\n        return msg;\n    }\n} catch(e) { return null; }\nreturn null;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1470,
+        "y": 380,
+        "wires": [
+            [
+                "c8a8a4765d854f55",
+                "12e942c6a82cb458"
+            ]
+        ]
+    },
+    {
+        "id": "baae5d86fa1ad011",
+        "type": "change",
+        "z": "45a002da4b6da150",
+        "name": "Set Mode",
+        "rules": [
+            {
+                "t": "set",
+                "p": "plot_mode",
+                "pt": "global",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 1640,
+        "y": 200,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "1a85801eccc4cd7e",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Set Selected Node & Redirect",
+        "func": "// FILTER PENGAMAN:\n// Hanya proses jika payload adalah STRING (ID Node, misal \"001\")\n// Abaikan jika payload adalah Object (Data update status)\nif (typeof msg.payload !== 'string') {\n    return null;\n}\n\n// 1. Set Global Variable\nglobal.set('selected_view_node', msg.payload);\n\n// 2. Notifikasi UI\nvar notifMsg = {payload: \"Memuat data Node: \" + msg.payload};\n\n// 3. Redirect ke Tab Analisis\nvar navMsg = {payload: {tab: \"PLOT & ANALISIS\"}};\n\nreturn [notifMsg, navMsg];",
+        "outputs": 2,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 950,
+        "y": 140,
+        "wires": [
+            [
+                "2094476ed0236d75",
+                "fbb50505e60d8008"
+            ],
+            [
+                "5bce9e170807a11a"
+            ]
+        ]
+    },
+    {
+        "id": "2094476ed0236d75",
+        "type": "ui_toast",
+        "z": "45a002da4b6da150",
+        "position": "bottom_right",
+        "displayTime": "2000",
+        "highlight": "",
+        "sendall": true,
+        "outputs": 0,
+        "ok": "OK",
+        "cancel": "",
+        "raw": false,
+        "className": "",
+        "topic": "",
+        "name": "Notif",
+        "x": 1110,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "5bce9e170807a11a",
+        "type": "ui_ui_control",
+        "z": "45a002da4b6da150",
+        "name": "Redirect Plot Tab",
+        "events": "all",
+        "x": 1430,
+        "y": 140,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "b6ec5bf8ee9d14ef",
+        "type": "change",
+        "z": "45a002da4b6da150",
+        "name": "Set Global CMD",
+        "rules": [
+            {
+                "t": "set",
+                "p": "global_command",
+                "pt": "global",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 350,
+        "y": 400,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "67380d952504cb13",
+        "type": "mqtt out",
+        "z": "45a002da4b6da150",
+        "name": "Ke Dragino",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "brk_mosquitto",
+        "x": 670,
+        "y": 360,
+        "wires": []
+    },
+    {
+        "id": "eb9218fc108fe873",
+        "type": "catch",
+        "z": "45a002da4b6da150",
+        "name": "On Deploy",
+        "scope": null,
+        "uncaught": false,
+        "x": 500,
+        "y": 80,
+        "wires": [
+            [
+                "a9cd432761e427e0"
+            ]
+        ]
+    },
+    {
+        "id": "a9cd432761e427e0",
+        "type": "change",
+        "z": "45a002da4b6da150",
+        "name": "Fetch Map",
+        "rules": [
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "seiscatch_status",
+                "tot": "global"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 910,
+        "y": 80,
+        "wires": [
+            [
+                "4c2d454c70fc6091"
+            ]
+        ]
+    },
+    {
+        "id": "9e5fb216c2cfba67",
+        "type": "ui_button",
+        "z": "45a002da4b6da150",
+        "name": "Export CSV",
+        "group": "grp_visual",
+        "order": 6,
+        "width": 7,
+        "height": 1,
+        "passthru": false,
+        "label": "UNDUH DATA (CSV)",
+        "tooltip": "",
+        "color": "#3E4E50",
+        "bgcolor": "#ECEFF1",
+        "className": "",
+        "icon": "fa-download",
+        "payload": "",
+        "payloadType": "str",
+        "topic": "export",
+        "topicType": "str",
+        "x": 1060,
+        "y": 460,
+        "wires": [
+            [
+                "8fe5ef2eed475a0e"
+            ]
+        ]
+    },
+    {
+        "id": "8fe5ef2eed475a0e",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Build Query",
+        "func": "var selectedNode = global.get('selected_view_node');\nif (!selectedNode) {\n    return null;\n}\nmsg.query = `SELECT * FROM seismic_raw WHERE \"topic\" = '${selectedNode}' ORDER BY time DESC LIMIT 1000`;\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1230,
+        "y": 460,
+        "wires": [
+            [
+                "3a3cace75e5789d7"
+            ]
+        ]
+    },
+    {
+        "id": "3a3cace75e5789d7",
+        "type": "influxdb in",
+        "z": "45a002da4b6da150",
+        "influxdb": "conf_influx",
+        "name": "Read DB",
+        "query": "",
+        "rawOutput": false,
+        "precision": "",
+        "retentionPolicy": "",
+        "org": "organisation",
+        "x": 1380,
+        "y": 460,
+        "wires": [
+            [
+                "6d3b9ac852fad1e0"
+            ]
+        ]
+    },
+    {
+        "id": "6d3b9ac852fad1e0",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "To CSV",
+        "func": "var data = msg.payload;\nif (!Array.isArray(data) || data.length === 0) return null;\n\nvar csv = \"timestamp,node_id,amplitude\\n\";\nfor (var i = 0; i < data.length; i++) {\n    var row = data[i];\n    csv += `${row.time},${row.topic},${row.payload}\\n`;\n}\nmsg.payload = csv;\nmsg.filename = \"seismic_\" + (global.get('selected_view_node') || \"data\") + \".csv\";\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1520,
+        "y": 460,
+        "wires": [
+            [
+                "081a3b0cca36eb62"
+            ]
+        ]
+    },
+    {
+        "id": "7351ca194b318655",
+        "type": "ui_button",
+        "z": "45a002da4b6da150",
+        "name": "Back Home",
+        "group": "grp_visual",
+        "order": 2,
+        "width": 3,
+        "height": 1,
+        "passthru": false,
+        "label": "",
+        "tooltip": "Kembali ke Daftar Node",
+        "color": "",
+        "bgcolor": "#ECEFF1",
+        "className": "",
+        "icon": "fa-arrow-left",
+        "payload": "0",
+        "payloadType": "num",
+        "topic": "nav",
+        "topicType": "str",
+        "x": 1250,
+        "y": 100,
+        "wires": [
+            [
+                "5bce9e170807a11a"
+            ]
+        ]
+    },
+    {
+        "id": "fbb50505e60d8008",
+        "type": "ui_text",
+        "z": "45a002da4b6da150",
+        "group": "grp_visual",
+        "order": 4,
+        "width": 7,
+        "height": 1,
+        "name": "",
+        "label": "Analisis Node:",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": "",
+        "color": "#000000",
+        "x": 1300,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "081a3b0cca36eb62",
+        "type": "ui_template",
+        "z": "45a002da4b6da150",
+        "group": "grp_visual",
+        "name": "Modal",
+        "order": 8,
+        "width": 7,
+        "height": 1,
+        "format": "<div id=\"csv-modal\" style=\"display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.6); backdrop-filter: blur(2px);\">\n    <div style=\"background-color:#fefefe; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 80%; max-width: 400px; border-radius: 8px; text-align: center; box-shadow: 0 4px 8px rgba(0,0,0,0.1); font-family: 'Roboto', sans-serif;\">\n        <h3 style=\"color:#3E4E50\">Data Siap!</h3>\n        <p style=\"color:#78909C; font-size:0.9em\">File CSV siap diunduh.</p>\n        <a id=\"csv-link\" href=\"#\" target=\"_blank\" \n           style=\"display:block; width:100%; padding:12px 0; background-color:#3E4E50; color:white; text-decoration:none; border-radius:4px; margin-bottom:10px; transition: background 0.3s;\">\n           <i class=\"fa fa-download\"></i> Download CSV\n        </a>\n        <button onclick=\"document.getElementById('csv-modal').style.display='none'\" \n                style=\"width:100%; padding:10px 0; border:none; background:#ECEFF1; color:#455A64; border-radius:4px; cursor:pointer;\">\n            Tutup\n        </button>\n    </div>\n</div>\n<script>\n    (function(scope) {\n        scope.$watch('msg', function(msg) {\n            if (msg && msg.payload) {\n                var blob = new Blob([msg.payload], { type: 'text/csv;charset=utf-8;' });\n                var url = URL.createObjectURL(blob);\n                var link = document.getElementById('csv-link');\n                link.href = url;\n                link.download = msg.filename;\n                document.getElementById('csv-modal').style.display = 'block';\n            }\n        });\n    })(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "templateScope": "local",
+        "x": 1670,
+        "y": 460,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "7a9f2250c14f0f4c",
+        "type": "ui_dropdown",
+        "z": "45a002da4b6da150",
+        "name": "Plot Mode",
+        "label": "Mode Tampilan:",
+        "tooltip": "",
+        "place": "Pilih Mode",
+        "group": "grp_visual",
+        "order": 1,
+        "width": 8,
+        "height": 1,
+        "passthru": true,
+        "multiple": false,
+        "options": [
+            {
+                "label": "Time Series (Gelombang)",
+                "value": "TIME",
+                "type": "str"
+            },
+            {
+                "label": "FFT Analysis",
+                "value": "FFT",
+                "type": "str"
+            }
+        ],
+        "payload": "",
+        "topic": "mode",
+        "topicType": "str",
+        "className": "",
+        "x": 1440,
+        "y": 260,
+        "wires": [
+            [
+                "baae5d86fa1ad011",
+                "c8a8a4765d854f55"
+            ]
+        ]
+    },
+    {
+        "id": "4c2d454c70fc6091",
+        "type": "ui_template",
+        "z": "45a002da4b6da150",
+        "group": "grp_control",
+        "name": "Node List Table",
+        "order": 6,
+        "width": 22,
+        "height": 4,
+        "format": "<style>\n    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');\n    body { font-family: 'Roboto', sans-serif; }\n    \n    .seis-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; cursor: pointer; }\n    .seis-table th { text-align: left; padding: 10px 5px; color: #546E7A; font-weight: 700; border-bottom: 2px solid #CFD8DC; text-transform: uppercase; font-size: 0.75rem; }\n    .seis-table td { padding: 12px 5px; border-bottom: 1px solid #ECEFF1; color: #37474F; }\n    .seis-table tr:hover { background-color: #F1F8E9; cursor: pointer; transition: background 0.2s; }\n    .seis-table tr.selected { background-color: #DCEDC8; border-left: 4px solid #558B2F; }\n    .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }\n    .bg-green { background: #558B2F; } \n    .bg-blue { background: #455A64; }  \n    .bg-orange { background: #D84315; } \n    .vcc-text { font-weight: 700; color: #263238; }\n    .click-hint { font-size: 0.7rem; color: #90A4AE; display: block; margin-top: 2px; font-style: italic; }\n</style>\n\n<table class=\"seis-table\">\n    <thead>\n        <tr>\n            <th>NODE ID</th>\n            <th>STATUS</th>\n            <th>Daya</th>\n        </tr>\n    </thead>\n    <tbody>\n        <tr ng-repeat=\"(id, node) in msg.payload\" ng-click=\"send({payload: id})\" ng-class=\"{'selected': node.selected}\">\n            <td>\n                <div style=\"font-weight:bold; font-size: 1rem;\">{{node.id}}</div>\n                <span class=\"click-hint\">Klik untuk Analisis</span>\n            </td>\n            <td><span class=\"badge\" \n                ng-class=\"{'bg-green': node.status.includes('Acquisition'), 'bg-blue': node.status.includes('Receiving'), 'bg-orange': node.status.includes('Poll')}\">\n                {{node.status}}</span>\n            </td>\n            <td><span class=\"vcc-text\">{{node.vcc}} mV</span></td>\n        </tr>\n    </tbody>\n</table>",
+        "storeOutMessages": true,
+        "fwdInMessages": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 660,
+        "y": 140,
+        "wires": [
+            [
+                "1a85801eccc4cd7e"
+            ]
+        ]
+    },
+    {
+        "id": "c8e35f1177217816",
+        "type": "ui_template",
+        "z": "45a002da4b6da150",
+        "group": "grp_control",
+        "name": "Header",
+        "order": 1,
+        "width": 30,
+        "height": "4",
+        "format": "<div style=\"text-align:center; background: white; padding: 15px; border-bottom: 4px solid #3E4E50; margin-bottom: 10px;\">\n    <h2 style=\"margin:0; color: #3E4E50; font-weight: 800; font-size: 3.8rem; letter-spacing: 1px;\">MESUR</h2>\n    <p style=\"margin:0; color: #78909C; font-size: 1.8rem; text-transform: uppercase;\">IoT Seismic Monitoring System</p>\n    <div style=\"margin-top: 5px; font-size: 2.2rem; color: #455A64; font-weight: 300;\">\n        <i class=\"fa fa-clock-o\"></i> <span id=\"sys-time\">Loading...</span>\n    </div>\n</div>\n<script>\n    (function(scope) {\n        setInterval(function() {\n            var d = new Date();\n            document.getElementById('sys-time').innerText = d.toLocaleTimeString();\n        }, 1000);\n    })(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": false,
+        "templateScope": "local",
+        "className": "",
+        "x": 130,
+        "y": 340,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "8b4d232b587c5ebe",
+        "type": "ui_template",
+        "z": "45a002da4b6da150",
+        "group": "grp_control",
+        "name": "Floating ACQ Button",
+        "order": 3,
+        "width": 10,
+        "height": 1,
+        "format": "<style>\n    .float-btn {\n        position: fixed;          /* Kunci posisi relatif terhadap layar */\n        bottom: 30px;             /* Jarak dari bawah */\n        right: 20px;              /* Jarak dari kanan */\n        background-color: #D84315; /* Warna Terra Cotta (Earth Tone) */\n        color: white;\n        border: none;\n        border-radius: 50px;      /* Membuat sudut bulat (Pill Shape) */\n        padding: 12px 24px;       /* Padding dalam tombol */\n        box-shadow: 0 4px 8px rgba(0,0,0,0.4); /* Efek bayangan */\n        font-weight: bold;\n        font-size: 14px;\n        cursor: pointer;\n        z-index: 9999;            /* Pastikan selalu di paling atas */\n        transition: transform 0.2s, background 0.2s;\n        display: flex;\n        align-items: center;\n        outline: none;\n    }\n\n    .float-btn:active {\n        transform: scale(0.95);   /* Efek membal saat ditekan */\n        background-color: #BF360C;\n    }\n\n    .float-btn i {\n        font-size: 18px;\n        margin-right: 8px;\n    }\n    \n    /* Animasi berdenyut agar user sadar tombol ini penting */\n    @keyframes pulse-orange {\n        0% { box-shadow: 0 0 0 0 rgba(216, 67, 21, 0.7); }\n        70% { box-shadow: 0 0 0 10px rgba(216, 67, 21, 0); }\n        100% { box-shadow: 0 0 0 0 rgba(216, 67, 21, 0); }\n    }\n    \n    .float-btn {\n        animation: pulse-orange 2s infinite;\n    }\n</style>\n\n<button class=\"float-btn\" ng-click=\"send({payload: 'REQ_ACQ'})\">\n    <i class=\"fa fa-podcast\"></i>\n    AKUISISI START!\n</button>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 160,
+        "y": 460,
+        "wires": [
+            [
+                "b6ec5bf8ee9d14ef"
+            ]
+        ]
+    },
+    {
+        "id": "node_ui_refresh_trigger",
+        "type": "ui_ui_control",
+        "z": "45a002da4b6da150",
+        "name": "Trigger: Refresh Home",
+        "events": "change",
+        "x": 680,
+        "y": 40,
+        "wires": [
+            [
+                "a9cd432761e427e0"
+            ]
+        ]
+    },
+    {
+        "id": "1270a57fdf0d86cf",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Format to DB",
+        "func": "// FORMATTER KHUSUS UNTUK INFLUXDB BATCH NODE\n// Input: msg.payload = [10, 25, -5, ...] (Array Angka)\n// Output: msg.payload = [{measurement:..., fields:..., tags:..., timestamp:...}, ...]\n\nvar values = msg.payload;\nvar nodeID = msg.topic || \"unknown\";\n\n// 1. Validasi Input\nif (!Array.isArray(values)) return null;\n\nvar batch = [];\nvar endTime = Date.now(); // Waktu saat paket diterima\nvar intervalMs = 20;      // Estimasi jeda antar sampel (50Hz)\n\n// 2. Loop Pembentukan Batch\nfor (var i = 0; i < values.length; i++) {\n\n    // Hitung waktu mundur untuk setiap sampel agar urut\n    var timeOffset = (values.length - 1 - i) * intervalMs;\n\n    // PENTING: Gunakan Objek Date() JavaScript. \n    // Node Batch InfluxDB akan otomatis mengonversinya ke presisi MS.\n    var uniqueTime = new Date(endTime - timeOffset);\n\n    batch.push({\n        // A. Nama Tabel (Measurement) - Wajib di Batch Mode\n        measurement: \"seismic_raw\",\n\n        // B. Tags (Index) - Agar bisa di-query per Node\n        tags: {\n            node_id: nodeID.toString()\n        },\n\n        // C. Fields (Data Nilai) - Wajib Integer\n        fields: {\n            amplitude: parseInt(values[i])\n        },\n\n        // D. Waktu Unik\n        timestamp: uniqueTime\n    });\n}\n\n// Kirim Array Batch ke Node Influx Batch\nmsg.payload = batch;\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 770,
+        "y": 200,
+        "wires": [
+            [
+                "3cded2d56e65b77b"
+            ]
+        ]
+    },
+    {
+        "id": "3cded2d56e65b77b",
+        "type": "influxdb batch",
+        "z": "45a002da4b6da150",
+        "influxdb": "conf_influx",
+        "precision": "ms",
+        "retentionPolicy": "",
+        "name": "",
+        "database": "database",
+        "precisionV18FluxV20": "ms",
+        "retentionPolicyV18Flux": "",
+        "org": "organisation",
+        "bucket": "bucket",
+        "x": 990,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "node_on_plot_show",
+        "type": "ui_ui_control",
+        "z": "45a002da4b6da150",
+        "name": "Trigger: On Plot Open",
+        "events": "change",
+        "x": 560,
+        "y": 640,
+        "wires": [
+            [
+                "node_filter_tab"
+            ]
+        ]
+    },
+    {
+        "id": "node_filter_tab",
+        "type": "switch",
+        "z": "45a002da4b6da150",
+        "name": "Is Plot Tab?",
+        "property": "payload.tab",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "eq",
+                "v": "PLOT & ANALISIS",
+                "vt": "str"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 1,
+        "x": 770,
+        "y": 640,
+        "wires": [
+            [
+                "node_history_query"
+            ]
+        ]
+    },
+    {
+        "id": "node_history_query",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Build History Query",
+        "func": "// FORMAT HISTORY (Influx -> Chart Format)\nvar data = msg.payload;\n\nif (!Array.isArray(data) || data.length === 0) return null;\n\nvar values = [];\n// InfluxDB mengirim data Terbaru -> Terlama (DESC). \n// Kita perlu membalikkannya agar Terlama -> Terbaru (ASC) untuk grafik.\nfor (var i = data.length - 1; i >= 0; i--) {\n    values.push(data[i].amplitude);\n}\n\n// Kirim ke Chart Formatter\nmsg.payload = values;\nmsg.topic = \"HISTORY_REPLAY\"; // Topik Khusus\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 980,
+        "y": 640,
+        "wires": [
+            [
+                "node_read_history"
+            ]
+        ]
+    },
+    {
+        "id": "node_read_history",
+        "type": "influxdb in",
+        "z": "45a002da4b6da150",
+        "influxdb": "conf_influx",
+        "name": "Fetch History",
+        "query": "",
+        "rawOutput": false,
+        "precision": "",
+        "retentionPolicy": "",
+        "org": "organisation",
+        "x": 1250,
+        "y": 640,
+        "wires": [
+            [
+                "node_format_chart"
+            ]
+        ]
+    },
+    {
+        "id": "node_format_chart",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Format to Chart",
+        "func": "var data = msg.payload;\nvar selectedNode = global.get('selected_view_node');\n\nif (!Array.isArray(data) || data.length === 0) return null;\n\n// Chart Node butuh array [{x,y}, {x,y}] untuk history reload\n// Influx memberikan data terurut DESC (Terbaru dulu), Chart butuh ASC (Terlama dulu)\n\nvar chartData = [];\n\n// Loop terbalik (dari data terlama ke terbaru)\nfor (var i = data.length - 1; i >= 0; i--) {\n    chartData.push({\n        x: new Date(data[i].time).getTime(),\n        y: data[i].amplitude\n    });\n}\n\n// Format khusus agar Chart me-replace data lama, bukan append\n// Mengirim array tunggal berisi objek data\nmsg.payload = [chartData];\nmsg.topic = selectedNode; // Agar warna konsisten\n\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1460,
+        "y": 640,
+        "wires": [
+            [
+                "2300328d14f7eb7b"
+            ]
+        ]
+    },
+    {
+        "id": "2300328d14f7eb7b",
+        "type": "ui_template",
+        "z": "45a002da4b6da150",
+        "group": "grp_visual",
+        "name": "Universal Chart (JS)",
+        "order": 10,
+        "width": 30,
+        "height": 10,
+        "format": "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n<div style=\"position: relative; height: 100%; width: 100%; padding: 10px;\">\n    <canvas id=\"seismicChart\"></canvas>\n</div>\n\n<script>\n(function(scope) {\n    var myChart = null;\n    var globalCounter = 0; // Counter Sumbu X\n    var MAX_POINTS = 1000; // Lebar Jendela\n\n    function initChart(config) {\n        var ctx = document.getElementById('seismicChart').getContext('2d');\n        if (myChart) myChart.destroy();\n        \n        // Reset counter hanya saat Ganti Mode/Config\n        globalCounter = 0;\n\n        myChart = new Chart(ctx, {\n            type: 'line',\n            data: {\n                labels: [],\n                datasets: [{\n                    label: config.legend,\n                    data: [],\n                    borderColor: config.color,\n                    borderWidth: 1.5,\n                    pointRadius: 0, fill: false, tension: 0.1\n                }]\n            },\n            options: {\n                responsive: true, maintainAspectRatio: false, animation: false,\n                scales: {\n                    x: { title: { display: true, text: config.xLabel }, ticks: { maxTicksLimit: 10 } },\n                    y: { title: { display: true, text: 'Amplitudo' } }\n                }\n            }\n        });\n    }\n\n    scope.$watch('msg', function(msg) {\n        if (!msg) return;\n\n        if (msg.topic === \"CONFIG_CHANGE\") {\n            initChart(msg.payload);\n        } \n        \n        // --- LOGIKA REPLACE (History / FFT) ---\n        else if (myChart && msg.topic === \"REPLACE_DATA\") {\n            myChart.data.labels = msg.payload.labels;\n            myChart.data.datasets[0].data = msg.payload.data;\n            \n            // SYNC COUNTER: Set counter ke jumlah data terakhir\n            // Agar data realtime berikutnya melanjutkannya (misal mulai dari 501)\n            if (msg.payload.isHistory) {\n                globalCounter = msg.payload.data.length;\n            }\n            \n            myChart.update();\n        }\n        \n        // --- LOGIKA APPEND (Realtime) ---\n        else if (myChart && msg.topic === \"APPEND_DATA\") {\n            var newData = msg.payload.data;\n            \n            for (var i = 0; i < newData.length; i++) {\n                myChart.data.labels.push(globalCounter++); // Pakai counter yang sudah di-sync\n                myChart.data.datasets[0].data.push(newData[i]);\n            }\n            \n            var excess = myChart.data.labels.length - MAX_POINTS;\n            if (excess > 0) {\n                myChart.data.labels.splice(0, excess);\n                myChart.data.datasets[0].data.splice(0, excess);\n            }\n            myChart.update('none');\n        }\n    });\n})(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1920,
+        "y": 320,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "c8a8a4765d854f55",
+        "type": "function",
+        "z": "45a002da4b6da150",
+        "name": "Chart Formatter",
+        "func": "// CHART FORMATTER FINAL (FFT Fix & Mode Sync)\n\n// 1. Pastikan membaca mode dari GLOBAL (agar sinkron dengan Dropdown)\nvar mode = global.get('plot_mode') || \"TIME\";\nvar outputMsg = {};\n\n// Deklarasi Variabel\nvar labels = [];\nvar values = [];\nvar xLabel = \"\";\nvar color = \"\";\nvar legend = \"\";\n\n// --- SKENARIO 1: RESET / GANTI MODE ---\nif (msg.topic === \"mode\" || msg.topic === \"clear\") {\n    xLabel = (msg.payload === \"TIME\") ? \"Urutan Sampel\" : \"Frekuensi (Hz)\";\n    color = (msg.payload === \"TIME\") ? \"#1f77b4\" : \"#d62728\"; \n    legend = (msg.payload === \"TIME\") ? \"Gelombang Seismik\" : \"Spektrum Frekuensi\";\n    \n    outputMsg.topic = \"CONFIG_CHANGE\";\n    outputMsg.payload = {\n        labels: [], data: [], xLabel: xLabel, color: color, legend: legend\n    };\n    return outputMsg;\n}\n\n// --- SKENARIO 2: DATA FFT (REPLACE TOTAL) ---\n// Kriteria: Mode FFT DAN Topik Frequency Spectrum\nif (mode === \"FFT\" && msg.topic === \"Frequency Spectrum\") {\n    var fftInput = msg.payload; \n    \n    // FIX UTAMA: Handle Nested Array (Array di dalam Array)\n    // Debug Anda menunjukkan: array[1] -> index 0 berisi array data\n    var cleanData = [];\n    if (Array.isArray(fftInput) && fftInput.length > 0 && Array.isArray(fftInput[0])) {\n        cleanData = fftInput[0]; // Ambil array di dalamnya\n    } else {\n        cleanData = fftInput;\n    }\n\n    labels = [];\n    values = [];\n    \n    // Pisahkan X (Freq) dan Y (Amp)\n    for(var i=0; i<cleanData.length; i++) {\n        // Pastikan objek memiliki properti x dan y\n        if (cleanData[i].x !== undefined) {\n            labels.push(cleanData[i].x); // Sumbu X: Frekuensi\n            values.push(cleanData[i].y); // Sumbu Y: Amplitudo\n        }\n    }\n    \n    // Gunakan topik REPLACE agar grafik digambar ulang total\n    outputMsg.topic = \"REPLACE_DATA\";\n    outputMsg.payload = { labels: labels, data: values };\n    return outputMsg;\n}\n\n// --- SKENARIO 3: DATA TIME SERIES ---\nif (mode === \"TIME\") {\n    var inputData = msg.payload;\n    \n    if (Array.isArray(inputData)) {\n        \n        // KASUS A: Data History (Array of Objects)\n        if ((inputData.length > 0 && inputData[0].x !== undefined) || (Array.isArray(inputData[0]))) {\n             var hist = Array.isArray(inputData[0]) ? inputData[0] : inputData;\n             values = hist.map(function(d) { return d.y; });\n             \n             outputMsg.topic = \"REPLACE_DATA\";\n             outputMsg.payload = { data: values, isHistory: true };\n             return outputMsg;\n        }\n        \n        // KASUS B: Data Realtime (Array of Integers)\n        else {\n             var startIndex = msg.start_index; \n             if (startIndex === undefined) startIndex = 0;\n\n             labels = [];\n             values = inputData;\n\n             for(var i=0; i<inputData.length; i++) {\n                 labels.push(startIndex + i);\n             }\n\n             outputMsg.topic = \"APPEND_DATA\";\n             outputMsg.payload = { \n                 data: values,\n                 labels: labels \n             };\n             return outputMsg;\n        }\n    }\n}\n\nreturn null;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1680,
+        "y": 320,
+        "wires": [
+            [
+                "2300328d14f7eb7b",
+                "b0e0865c8cb70b4b"
+            ]
+        ]
+    },
+    {
+        "id": "12e942c6a82cb458",
+        "type": "debug",
+        "z": "45a002da4b6da150",
+        "name": "debug 2",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1740,
+        "y": 600,
+        "wires": []
+    },
+    {
+        "id": "b0e0865c8cb70b4b",
+        "type": "debug",
+        "z": "45a002da4b6da150",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1830,
+        "y": 440,
+        "wires": []
+    },
+    {
+        "id": "51c839ddf0eb5293",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 9,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "2c9aca5fb51e15e1",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 10,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "816b00cf56fcbdb9",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 11,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "becbc4c9d56a4036",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 12,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "b87acf59fb689464",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 13,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "1de90e1936083180",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 3,
+        "width": 19,
+        "height": 1
+    },
+    {
+        "id": "b4046e5ebf1721e5",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 5,
+        "width": 23,
+        "height": 1
+    },
+    {
+        "id": "cd9bd6f2e8003ad5",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 7,
+        "width": 23,
+        "height": 1
+    },
+    {
+        "id": "65ab49dfb9503c97",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 9,
+        "width": 23,
+        "height": 1
+    },
+    {
+        "id": "4921cc9a99f266d6",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 8,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "c209b0cb4f774109",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 7,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "4212536102dd8880",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 5,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "7afc07b80edf952c",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 4,
+        "width": 10,
+        "height": 1
+    },
+    {
+        "id": "aff1cecddada4f96",
+        "type": "ui_spacer",
+        "z": "45a002da4b6da150",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 2,
+        "width": 10,
+        "height": 1
+    },
+    {
+        "id": "brk_mosquitto",
+        "type": "mqtt-broker",
+        "name": "Local Broker",
+        "broker": "mosquitto",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "grp_visual",
+        "type": "ui_group",
+        "name": "VISUALISASI & ANALISIS",
+        "tab": "930c653161f1a129",
+        "order": 2,
+        "disp": true,
+        "width": 30,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "conf_influx",
+        "type": "influxdb",
+        "hostname": "influxdb",
+        "port": "8086",
+        "protocol": "http",
+        "database": "seismic_data",
+        "name": "Seismic DB",
+        "usetls": false,
+        "tls": "",
+        "influxdbVersion": "1.x",
+        "url": "http://localhost:8086",
+        "timeout": "",
+        "rejectUnauthorized": true
+    },
+    {
+        "id": "grp_control",
+        "type": "ui_group",
+        "name": "SOH & KONTROL",
+        "tab": "tab_dashboard",
+        "order": 1,
+        "disp": true,
+        "width": 30,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "930c653161f1a129",
+        "type": "ui_tab",
+        "name": "PLOT & ANALISIS",
+        "icon": "fa-area-chart",
+        "order": 2,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "tab_dashboard",
+        "type": "ui_tab",
+        "name": "Dashboard Utama",
+        "icon": "dashboard",
+        "order": 1,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "42a1df849ef90eab",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6",
+            "node-red-contrib-influxdb": "0.7.0"
+        }
+    }
+]
