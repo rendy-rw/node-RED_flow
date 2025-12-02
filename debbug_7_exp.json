@@ -1,0 +1,1472 @@
+[
+    {
+        "id": "4b0d46176830263d",
+        "type": "tab",
+        "label": "MESUR 3 SYSTEM",
+        "disabled": false,
+        "info": "Sistem Monitoring Seismik IoT Final v2.0\n- Fixed Syntax Errors\n- Multi-Node Support\n- Master-Detail View"
+    },
+    {
+        "id": "c10bd4eb1ea73e9b",
+        "type": "inject",
+        "z": "4b0d46176830263d",
+        "name": "Init on Boot",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "0.1",
+        "topic": "",
+        "payload": "{}",
+        "payloadType": "json",
+        "x": 130,
+        "y": 80,
+        "wires": [
+            [
+                "77021b38fae22db8"
+            ]
+        ]
+    },
+    {
+        "id": "77021b38fae22db8",
+        "type": "change",
+        "z": "4b0d46176830263d",
+        "name": "Reset Globals",
+        "rules": [
+            {
+                "t": "set",
+                "p": "seiscatch_status",
+                "pt": "global",
+                "to": "{}",
+                "tot": "json"
+            },
+            {
+                "t": "set",
+                "p": "global_command",
+                "pt": "global",
+                "to": "STOP",
+                "tot": "str"
+            },
+            {
+                "t": "set",
+                "p": "plot_mode",
+                "pt": "flow",
+                "to": "TIME",
+                "tot": "str"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 320,
+        "y": 80,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "b8e5fdd96ce1dfa1",
+        "type": "mqtt in",
+        "z": "4b0d46176830263d",
+        "name": "Uplink (Wildcard)",
+        "topic": "seismic/uplink/#",
+        "qos": "0",
+        "datatype": "auto",
+        "broker": "brk_mosquitto",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 100,
+        "y": 200,
+        "wires": [
+            [
+                "fd2c530723fb3ace",
+                "b514e271aee61785"
+            ]
+        ]
+    },
+    {
+        "id": "fd2c530723fb3ace",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Logic Core (Router)",
+        "func": "// LOGIC CORE FINAL (Schedule Enforcement & Late Joiner Only)\n\nvar payload = msg.payload;\nvar topicParts = msg.topic.split('/');\nvar nodeID = topicParts[topicParts.length - 1];\n\n// Fallback jika topik tidak valid\nif (!nodeID || nodeID === \"uplink\") nodeID = \"001\";\n\n// 1. INPUT HANDLING\nvar strInput = (Buffer.isBuffer(payload)) ? payload.toString('utf8') : payload.toString();\nstrInput = strInput.trim();\n\n// 2. HEADER STRIPPING\nvar lastComma = strInput.lastIndexOf(',');\nvar cleanStr = (lastComma !== -1) ? strInput.substring(lastComma + 1).trim() : strInput;\nvar msgContent = cleanStr.replace(/<.*?>/, \"\").trim();\n\n// 3. INIT STATUS\nvar statusMap = global.get('seiscatch_status') || {};\nif (!statusMap[nodeID]) {\n    statusMap[nodeID] = { vcc: 0, status: \"Online\", time: Date.now(), id: nodeID };\n}\n\n// =================================================\n// JALUR A: DATA STATUS (TEKS)\n// =================================================\nif (msgContent.includes(\"stat=\") || msgContent.includes(\"sys=\")) {\n\n    // A.1 Start Session (T0)\n    if (msgContent.includes(\"stat=SESSION\")) {\n        var t0Match = msgContent.match(/t0=(\\d+)/);\n        if (t0Match) {\n            var t0_val = parseInt(t0Match[1]);\n            global.set('session_t0_' + nodeID, t0_val * 1000);\n            statusMap[nodeID].status = \"Session Started\";\n        }\n    }\n\n    // A.2 Status READY\n    if (msgContent.includes(\"stat=READY\")) {\n        statusMap[nodeID].status = \"READY (Waiting Fetch)\";\n    }\n\n    // A.3 Update VCC\n    if (msgContent.includes(\"sys=\")) {\n        var match = msgContent.match(/sys=(\\d+)/);\n        if (match) statusMap[nodeID].vcc = parseInt(match[1]);\n        statusMap[nodeID].status = \"Idle / Polling\";\n    }\n    statusMap[nodeID].time = Date.now();\n\n    // A.4 Handshake Waktu (TIME_REQ)\n    // WAJIB: Wemos butuh waktu server agar bisa menghitung mundur jadwal ACQ_AT\n    if (msgContent.includes(\"stat=TIME_REQ\")) {\n        var now = Math.floor(Date.now() / 1000);\n        setTimeout(function () {\n            var dlPayload = \"<\" + nodeID + \">TIME:\" + now;\n            node.send([null, null, { payload: dlPayload, topic: \"seismic/downlink/\" }]);\n        }, 1200);\n        statusMap[nodeID].status = \"Syncing Time\";\n    }\n\n    // A.5 Cek Tugas (POLL) - LOGIKA BARU (STRICT SCHEDULE)\n    if (msgContent.includes(\"stat=POLL\")) {\n\n        // Cek apakah ada jadwal aktif di masa depan?\n        var targetTime = global.get('acq_target_time');\n        var nowSec = Math.floor(Date.now() / 1000);\n\n        // Hanya kirim perintah jika Target Time > Waktu Sekarang\n        if (targetTime && targetTime > nowSec) {\n            var timeLeft = targetTime - nowSec;\n\n            // Jangan kirim jika sisa waktu terlalu mepet (< 5 detik)\n            if (timeLeft > 5) {\n                // node.warn(\"Node \" + nodeID + \" Late Join. Sending Schedule.\");\n                setTimeout(function () {\n                    // Kirim Jadwal (ACQ_AT)\n                    var dlPayload = \"<\" + \"BROADCAST\" + \">ACQ_AT:\" + targetTime;\n                    node.send([null, null, { payload: dlPayload, topic: \"seismic/downlink/\" }]);\n                }, 1200);\n                statusMap[nodeID].status = \"Scheduled ( in \" + timeLeft + \"s )\";\n            } else {\n                statusMap[nodeID].status = \"Too Late for Schedule\";\n            }\n        }\n        else {\n            // Jika tidak ada jadwal masa depan, biarkan IDLE.\n            // JANGAN PERNAH KIRIM ACQ_START DISINI LAGI.\n            statusMap[nodeID].status = \"Idle (No Schedule)\";\n        }\n    }\n\n    global.set('seiscatch_status', statusMap);\n    node.send([{ payload: statusMap }, null, null]);\n    return null;\n}\n\n// =================================================\n// JALUR B: DATA SEISMIK (HEX STRING)\n// =================================================\nelse if (msgContent.length > 20) {\n    statusMap[nodeID].status = \"Receiving Data\";\n    statusMap[nodeID].time = Date.now();\n    global.set('seiscatch_status', statusMap);\n    node.send([{ payload: statusMap }, null, null]);\n\n    try {\n        var dataBuffer = Buffer.from(msgContent, 'hex');\n        if (dataBuffer.length > 0) {\n            var msgBiner = { payload: dataBuffer, topic: nodeID };\n            node.send([null, msgBiner, null]);\n        }\n    } catch (e) { return null; }\n}\n\nreturn null;",
+        "outputs": 3,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 360,
+        "y": 200,
+        "wires": [
+            [
+                "c4de66d3ebfc9eb6"
+            ],
+            [
+                "a39ab7b5478f4e4c"
+            ],
+            [
+                "5689ac759f6f5649"
+            ]
+        ]
+    },
+    {
+        "id": "a39ab7b5478f4e4c",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Binary Parser (Int16)",
+        "func": "// BINARY PARSER FINAL (Clean Version)\n// Input: Buffer [Seq (1 Byte), Data (Int16)...]\n// Header <ID> diasumsikan sudah dibuang oleh Logic Core.\n\nvar buf = msg.payload;\nvar nodeID = msg.topic;\n\n// 1. Validasi Dasar\n// Minimal harus ada 1 byte Seq + 2 byte Data (1 sampel) = 3 byte\nif (!Buffer.isBuffer(buf) || buf.length < 3) return null;\n\n// 2. Ambil Sequence (Pasti di Byte ke-0)\nvar seqNum = buf[0];\n\n// 3. Ambil Data Seismik (Mulai dari Byte ke-1)\nvar seismicData = buf.slice(1); \n\nvar points = [];\n\n// 4. Decoding Int16 Little Endian\n// Loop sepanjang data yang tersisa\nfor (var i = 0; i < seismicData.length; i += 2) {\n    // Pastikan pasangan byte lengkap (Low + High)\n    if (i + 1 < seismicData.length) {\n        var val = seismicData.readInt16LE(i);\n        points.push(val);\n    }\n}\n\n// 5. Output\nmsg.payload = points;\nmsg.topic = nodeID;\nmsg.packet_seq = seqNum; // Sertakan untuk debugging / perhitungan waktu DB\n\n// Info debug panjang data\nmsg.data_len = seismicData.length; \n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 240,
+        "wires": [
+            [
+                "17f57f866a6f092d",
+                "node_prog_logic"
+            ]
+        ]
+    },
+    {
+        "id": "b342767ebf8db84f",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Set Selected Node & Redirect",
+        "func": "// FILTER PENGAMAN:\n// Hanya proses jika payload adalah STRING (ID Node, misal \"001\")\n// Abaikan jika payload adalah Object (Data update status)\nif (typeof msg.payload !== 'string') {\n    return null;\n}\n\n// 1. Set Global Variable\nglobal.set('selected_view_node', msg.payload);\n\n// 2. Notifikasi UI\nvar notifMsg = {payload: \"Memuat data Node: \" + msg.payload};\n\n// 3. Redirect ke Tab Analisis\nvar navMsg = {payload: {tab: \"PLOT & ANALISIS\"}};\n\nreturn [notifMsg, navMsg];",
+        "outputs": 2,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 950,
+        "y": 140,
+        "wires": [
+            [
+                "e1e3a55fc83d061e",
+                "21697e6f0594d951"
+            ],
+            [
+                "bdc77e620892f515"
+            ]
+        ]
+    },
+    {
+        "id": "e1e3a55fc83d061e",
+        "type": "ui_toast",
+        "z": "4b0d46176830263d",
+        "position": "bottom_right",
+        "displayTime": "2000",
+        "highlight": "",
+        "sendall": true,
+        "outputs": 0,
+        "ok": "OK",
+        "cancel": "",
+        "raw": false,
+        "className": "",
+        "topic": "",
+        "name": "Notif",
+        "x": 1110,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "bdc77e620892f515",
+        "type": "ui_ui_control",
+        "z": "4b0d46176830263d",
+        "name": "Redirect Plot Tab",
+        "events": "all",
+        "x": 1350,
+        "y": 160,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "5689ac759f6f5649",
+        "type": "mqtt out",
+        "z": "4b0d46176830263d",
+        "name": "Ke Dragino",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "brk_mosquitto",
+        "x": 630,
+        "y": 300,
+        "wires": []
+    },
+    {
+        "id": "4763faf0c8a849c7",
+        "type": "catch",
+        "z": "4b0d46176830263d",
+        "name": "On Deploy",
+        "scope": null,
+        "uncaught": false,
+        "x": 500,
+        "y": 80,
+        "wires": [
+            [
+                "416a3f916355ab56"
+            ]
+        ]
+    },
+    {
+        "id": "416a3f916355ab56",
+        "type": "change",
+        "z": "4b0d46176830263d",
+        "name": "Fetch Map",
+        "rules": [
+            {
+                "t": "set",
+                "p": "payload",
+                "pt": "msg",
+                "to": "seiscatch_status",
+                "tot": "global"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 910,
+        "y": 80,
+        "wires": [
+            [
+                "c4de66d3ebfc9eb6"
+            ]
+        ]
+    },
+    {
+        "id": "3511fd9751309dee",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "Export CSV",
+        "group": "grp_visual",
+        "order": 6,
+        "width": 7,
+        "height": 1,
+        "passthru": false,
+        "label": "UNDUH DATA (CSV)",
+        "tooltip": "",
+        "color": "#3E4E50",
+        "bgcolor": "#ECEFF1",
+        "className": "",
+        "icon": "fa-download",
+        "payload": "",
+        "payloadType": "str",
+        "topic": "export",
+        "topicType": "str",
+        "x": 340,
+        "y": 880,
+        "wires": [
+            [
+                "9dfa24d2ac1e33fd"
+            ]
+        ]
+    },
+    {
+        "id": "9dfa24d2ac1e33fd",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Build Query",
+        "func": "// BUILD QUERY: SESSION AWARE (FIXED)\n\n// 1. Ambil Node ID yang dipilih\nvar selectedNode = global.get('selected_view_node');\n\nif (!selectedNode) {\n    node.warn(\"⚠️ Tidak ada node yang dipilih untuk didownload.\");\n    return null;\n}\n\n// 2. Ambil Waktu Mulai Sesi Terakhir (T0) dari Global Variable\n// Variabel ini dibuat oleh Logic Core saat menerima \"stat=SESSION\"\nvar sessionStartMs = global.get('session_t0_' + selectedNode);\n\nvar query = \"\";\n\n// 3. Logika Pemilihan Data\nif (sessionStartMs) {\n    // SKENARIO UTAMA: Ada data sesi aktif\n    // Ambil data di mana waktu >= Waktu Mulai Sesi\n    // Kita urutkan ASC (Lama ke Baru) agar CSV rapi dari detik 0 ke detik 5.\n\n    // Note: InfluxQL butuh suffix 'ms' jika kita pakai epoch milliseconds\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' AND time >= ${sessionStartMs}ms ORDER BY time ASC`;\n\n    node.warn(\"Downloading Session starting at: \" + new Date(sessionStartMs).toLocaleString());\n}\nelse {\n    // SKENARIO CADANGAN: Jika T0 tidak ada (misal baru restart Node-RED)\n    // Ambil 1000 data terakhir saja sebagai fallback\n\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' ORDER BY time DESC LIMIT 1000`;\n\n    node.warn(\"⚠️ Warning: T0 tidak ditemukan. Mengambil 1000 data terakhir.\");\n}\n\nmsg.query = query;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 510,
+        "y": 880,
+        "wires": [
+            [
+                "c5ab2b9fed8d8798"
+            ]
+        ]
+    },
+    {
+        "id": "c5ab2b9fed8d8798",
+        "type": "influxdb in",
+        "z": "4b0d46176830263d",
+        "influxdb": "conf_influx",
+        "name": "Read DB",
+        "query": "",
+        "rawOutput": false,
+        "precision": "",
+        "retentionPolicy": "",
+        "org": "organisation",
+        "x": 660,
+        "y": 880,
+        "wires": [
+            [
+                "8514800b210b19b7"
+            ]
+        ]
+    },
+    {
+        "id": "8514800b210b19b7",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "To CSV",
+        "func": "// TO CSV (Fixed Node ID Logic)\n\nvar data = msg.payload;\n// 1. Ambil ID Node langsung dari Pilihan User (Pasti Benar)\nvar currentNode = global.get('selected_view_node') || \"unknown\";\n\n// Validasi Data\nif (!Array.isArray(data) || data.length === 0) {\n    return null; // Jangan lanjutkan jika kosong\n}\n\n// Header CSV\nvar csv = \"timestamp,node_id,amplitude\\n\";\n\n// Loop Data\nfor (var i = 0; i < data.length; i++) {\n    var row = data[i];\n\n    // Kita gunakan 'currentNode' yang kita ambil dari Global\n    // row.amplitude adalah nilai getaran dari database\n    csv += `${row.time},${currentNode},${row.amplitude}\\n`;\n}\n\nmsg.payload = csv;\n\n// Nama File: seismic_001_timestamp.csv\nvar timeStr = new Date().toISOString().replace(/[:.]/g, \"-\").slice(0, 19);\nmsg.filename = `seismic_${currentNode}_${timeStr}.csv`;\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 800,
+        "y": 880,
+        "wires": [
+            [
+                "d846576f7372cc10"
+            ]
+        ]
+    },
+    {
+        "id": "ec71eb28517d2790",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "Back Home",
+        "group": "grp_visual",
+        "order": 4,
+        "width": 3,
+        "height": 1,
+        "passthru": false,
+        "label": "",
+        "tooltip": "Kembali ke Daftar Node",
+        "color": "",
+        "bgcolor": "#ECEFF1",
+        "className": "",
+        "icon": "fa-arrow-left",
+        "payload": "{\"tab\":\"Dashboard Utama\"}",
+        "payloadType": "json",
+        "topic": "",
+        "topicType": "str",
+        "x": 1270,
+        "y": 100,
+        "wires": [
+            [
+                "bdc77e620892f515",
+                "416a3f916355ab56"
+            ]
+        ]
+    },
+    {
+        "id": "21697e6f0594d951",
+        "type": "ui_text",
+        "z": "4b0d46176830263d",
+        "group": "grp_visual",
+        "order": 5,
+        "width": 7,
+        "height": 1,
+        "name": "",
+        "label": "Analisis Node:",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": "",
+        "color": "#000000",
+        "x": 1300,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "d846576f7372cc10",
+        "type": "ui_template",
+        "z": "4b0d46176830263d",
+        "group": "grp_visual",
+        "name": "Modal",
+        "order": 8,
+        "width": 7,
+        "height": 1,
+        "format": "<div id=\"csv-modal\" style=\"display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; overflow:auto; background-color:rgba(0,0,0,0.6); backdrop-filter: blur(2px);\">\n    <div style=\"background-color:#fefefe; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 80%; max-width: 400px; border-radius: 8px; text-align: center; box-shadow: 0 4px 8px rgba(0,0,0,0.1); font-family: 'Roboto', sans-serif;\">\n        <h3 style=\"color:#3E4E50\">Data Siap!</h3>\n        <p style=\"color:#78909C; font-size:0.9em\">File CSV siap diunduh.</p>\n        <a id=\"csv-link\" href=\"#\" target=\"_blank\" \n           style=\"display:block; width:100%; padding:12px 0; background-color:#3E4E50; color:white; text-decoration:none; border-radius:4px; margin-bottom:10px; transition: background 0.3s;\">\n           <i class=\"fa fa-download\"></i> Download CSV\n        </a>\n        <button onclick=\"document.getElementById('csv-modal').style.display='none'\" \n                style=\"width:100%; padding:10px 0; border:none; background:#ECEFF1; color:#455A64; border-radius:4px; cursor:pointer;\">\n            Tutup\n        </button>\n    </div>\n</div>\n<script>\n    (function(scope) {\n        scope.$watch('msg', function(msg) {\n            if (msg && msg.payload) {\n                var blob = new Blob([msg.payload], { type: 'text/csv;charset=utf-8;' });\n                var url = URL.createObjectURL(blob);\n                var link = document.getElementById('csv-link');\n                link.href = url;\n                link.download = msg.filename;\n                document.getElementById('csv-modal').style.display = 'block';\n            }\n        });\n    })(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": false,
+        "templateScope": "local",
+        "className": "",
+        "x": 950,
+        "y": 880,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "c4de66d3ebfc9eb6",
+        "type": "ui_template",
+        "z": "4b0d46176830263d",
+        "group": "grp_control",
+        "name": "Node List Table",
+        "order": 8,
+        "width": 22,
+        "height": 4,
+        "format": "<style>\n    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');\n    body { font-family: 'Roboto', sans-serif; }\n    \n    .seis-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; cursor: pointer; }\n    .seis-table th { text-align: left; padding: 10px 5px; color: #546E7A; font-weight: 700; border-bottom: 2px solid #CFD8DC; text-transform: uppercase; font-size: 0.75rem; }\n    .seis-table td { padding: 12px 5px; border-bottom: 1px solid #ECEFF1; color: #37474F; }\n    .seis-table tr:hover { background-color: #F1F8E9; cursor: pointer; transition: background 0.2s; }\n    .seis-table tr.selected { background-color: #DCEDC8; border-left: 4px solid #558B2F; }\n    .badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }\n    .bg-green { background: #558B2F; } \n    .bg-blue { background: #455A64; }  \n    .bg-orange { background: #D84315; } \n    .vcc-text { font-weight: 700; color: #263238; }\n    .click-hint { font-size: 0.7rem; color: #90A4AE; display: block; margin-top: 2px; font-style: italic; }\n</style>\n\n<table class=\"seis-table\">\n    <thead>\n        <tr>\n            <th>NODE ID</th>\n            <th>STATUS</th>\n            <th>Daya</th>\n        </tr>\n    </thead>\n    <tbody>\n        <tr ng-repeat=\"(id, node) in msg.payload\" ng-click=\"send({payload: id})\" ng-class=\"{'selected': node.selected}\">\n            <td>\n                <div style=\"font-weight:bold; font-size: 1rem;\">{{node.id}}</div>\n                <span class=\"click-hint\">Klik untuk Analisis</span>\n            </td>\n            <td><span class=\"badge\" \n                ng-class=\"{'bg-green': node.status.includes('Acquisition'), 'bg-blue': node.status.includes('Receiving'), 'bg-orange': node.status.includes('Poll')}\">\n                {{node.status}}</span>\n            </td>\n            <td><span class=\"vcc-text\">{{node.vcc}} mV</span></td>\n        </tr>\n    </tbody>\n</table>",
+        "storeOutMessages": true,
+        "fwdInMessages": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 660,
+        "y": 140,
+        "wires": [
+            [
+                "b342767ebf8db84f"
+            ]
+        ]
+    },
+    {
+        "id": "90e64a3aa09d5c56",
+        "type": "ui_template",
+        "z": "4b0d46176830263d",
+        "group": "grp_control",
+        "name": "Header",
+        "order": 4,
+        "width": 30,
+        "height": 4,
+        "format": "<div style=\"text-align:center; background: white; padding: 15px; border-bottom: 4px solid #3E4E50; margin-bottom: 10px;\">\n    <h2 style=\"margin:0; color: #3E4E50; font-weight: 800; font-size: 3.8rem; letter-spacing: 1px;\">MESUR</h2>\n    <p style=\"margin:0; color: #78909C; font-size: 1.8rem; text-transform: uppercase;\">Milivolt Seismic Sense Utilizing LoRa</p>\n    <div style=\"margin-top: 5px; font-size: 2.2rem; color: #455A64; font-weight: 300;\">\n        <i class=\"fa fa-clock-o\"></i> <span id=\"sys-time\">Loading...</span>\n    </div>\n</div>\n<script>\n    (function(scope) {\n        setInterval(function() {\n            var d = new Date();\n            document.getElementById('sys-time').innerText = d.toLocaleTimeString();\n        }, 1000);\n    })(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": false,
+        "templateScope": "local",
+        "className": "",
+        "x": 180,
+        "y": 240,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "17f57f866a6f092d",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Format to DB",
+        "func": "// FORMATTER DB (Absolute Time Calculation)\nvar values = msg.payload;\nvar nodeID = msg.topic || \"001\";\nvar seqNum = msg.packet_seq;\n\nif (!Array.isArray(values)) return null;\nif (seqNum === undefined) seqNum = 0; // Safety\n\nvar batch = [];\n\n// Ambil T0 dari Global\nvar t0_epoch_ms = global.get('session_t0_' + nodeID);\n\n// Fallback jika T0 tidak ada (pakai waktu sekarang)\nif (!t0_epoch_ms) t0_epoch_ms = Date.now();\n\n// Parameter Sampling\nvar intervalMs = 10; // 100Hz = 10ms\nvar samplesPerPacket = 30; // Sesuaikan dengan chunk Wemos (60 byte / 2)\n\n// Hitung Waktu Awal Paket Ini\nvar packetStartTimeMs = t0_epoch_ms + (seqNum * samplesPerPacket * intervalMs);\n\nfor (var i = 0; i < values.length; i++) {\n    var absoluteTime = packetStartTimeMs + (i * intervalMs);\n\n    batch.push({\n        measurement: \"seismic_raw\",\n        tags: { node_id: nodeID.toString() },\n        fields: { amplitude: parseInt(values[i]) },\n        timestamp: new Date(absoluteTime) // Object Date\n    });\n}\n\nmsg.payload = batch;\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 760,
+        "y": 180,
+        "wires": [
+            [
+                "2e16174020b75511"
+            ]
+        ]
+    },
+    {
+        "id": "2e16174020b75511",
+        "type": "influxdb batch",
+        "z": "4b0d46176830263d",
+        "influxdb": "conf_influx",
+        "precision": "ms",
+        "retentionPolicy": "",
+        "name": "",
+        "database": "database",
+        "precisionV18FluxV20": "ms",
+        "retentionPolicyV18Flux": "",
+        "org": "organisation",
+        "bucket": "bucket",
+        "x": 980,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "ec6a6ec71c493546",
+        "type": "ui_template",
+        "z": "4b0d46176830263d",
+        "group": "grp_visual",
+        "name": "Universal Chart (JS)",
+        "order": 10,
+        "width": 30,
+        "height": 6,
+        "format": "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n<div style=\"position: relative; height: 100%; width: 100%; padding: 10px;\">\n    <canvas id=\"seismicChart\"></canvas>\n</div>\n\n<script>\n(function(scope) {\n    var myChart = null;\n    var globalCounter = 0; \n    var MAX_POINTS = 1000; \n\n    // Konfigurasi Default\n    var defaultConfig = {\n        labels: [], data: [], xLabel: \"Urutan Sampel\", color: \"#1f77b4\", legend: \"ADC Reading\"\n    };\n\n    function initChart(config) {\n        var ctx = document.getElementById('seismicChart').getContext('2d');\n        if (myChart) myChart.destroy();\n\n        myChart = new Chart(ctx, {\n            type: 'line',\n            data: {\n                labels: config.labels || [],\n                datasets: [{\n                    label: config.legend,\n                    data: config.data || [],\n                    borderColor: config.color,\n                    borderWidth: 1.5,\n                    pointRadius: 0, fill: false, tension: 0.1\n                }]\n            },\n            options: {\n                responsive: true, maintainAspectRatio: false, animation: false,\n                interaction: { mode: 'index', intersect: false },\n                scales: {\n                    x: { title: { display: true, text: config.xLabel }, ticks: { maxTicksLimit: 10 } },\n                    y: { title: { display: true, text: 'Amplitudo' } }\n                }\n            }\n        });\n    }\n\n    setTimeout(function() { if (!myChart) initChart(defaultConfig); }, 200);\n\n    scope.$watch('msg', function(msg) {\n        if (!msg) return;\n\n        // A. GANTI KONFIGURASI\n        if (msg.topic === \"CONFIG_CHANGE\") {\n            initChart(msg.payload);\n        } \n        \n        // B. REPLACE DATA (History / FFT)\n        else if (myChart && msg.topic === \"REPLACE_DATA\") {\n            myChart.data.labels = msg.payload.labels;\n            myChart.data.datasets[0].data = msg.payload.data;\n            \n            // *** FIX: SINKRONISASI COUNTER DARI BACKEND ***\n            if (msg.payload.isHistory && msg.payload.lastCounter !== undefined) {\n                globalCounter = msg.payload.lastCounter;\n            } else {\n                // Jika FFT atau lainnya, reset counter dummy\n                globalCounter = msg.payload.data.length;\n            }\n            \n            myChart.update();\n        }\n        \n        // C. APPEND DATA (Realtime)\n        else if (myChart && msg.topic === \"APPEND_DATA\") {\n            var newData = msg.payload.data;\n            var newLabels = msg.payload.labels; \n            \n            if (newData && newLabels) {\n                for (var i = 0; i < newData.length; i++) {\n                    // Prioritaskan label dari backend jika ada\n                    // Jika tidak, pakai globalCounter lokal (fallback)\n                    var lbl = (newLabels[i] !== undefined) ? newLabels[i] : globalCounter++;\n                    \n                    myChart.data.labels.push(lbl);\n                    myChart.data.datasets[0].data.push(newData[i]);\n                    \n                    // Sync lokal counter jika label backend lebih besar\n                    if (lbl >= globalCounter) globalCounter = lbl + 1;\n                }\n                \n                var excess = myChart.data.labels.length - MAX_POINTS;\n                if (excess > 0) {\n                    myChart.data.labels.splice(0, excess);\n                    myChart.data.datasets[0].data.splice(0, excess);\n                }\n                myChart.update('none'); \n            }\n        }\n    });\n})(scope);\n</script>",
+        "storeOutMessages": true,
+        "fwdInMessages": true,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1350,
+        "y": 700,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "101677531990619f",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Chart Formatter",
+        "func": "// CHART FORMATTER (Time Series Dedicated)\n// Menangani: \n// 1. APPEND_DATA (Realtime dari Dispatcher)\n// 2. REPLACE_DATA (History dari Database)\n\nvar inputData = msg.payload;\nvar outputMsg = {};\nvar labels = [];\nvar values = [];\n\n// Validasi: Data harus Array\nif (!Array.isArray(inputData)) return null;\n\n// --- KASUS A: HISTORY REPLAY (REPLACE) ---\n// Ciri: Topik khusus 'HISTORY_REPLAY' (dari node Format History)\nif (msg.topic === \"HISTORY_REPLAY\") {\n    \n    // Data history formatnya: [{x: time, y: amp}, ...]\n    // Kita perlu pisahkan untuk Chart.js\n    var histData = inputData[0]; // Biasanya dibungkus array luar oleh Format History\n    \n    // Jika formatnya belum terbungkus array luar, pakai langsung\n    if (!Array.isArray(histData)) histData = inputData;\n\n    labels = histData.map(function(d) { return new Date(d.x).toLocaleTimeString(); });\n    values = histData.map(function(d) { return d.y; });\n\n    outputMsg.topic = \"REPLACE_DATA\";\n    outputMsg.payload = { \n        data: values, \n        labels: labels, // Label waktu real untuk history\n        isHistory: true \n    };\n    return outputMsg;\n}\n\n// --- KASUS B: REALTIME STREAMING (APPEND) ---\n// Ciri: Array Angka Murni (Integer) dari Dispatcher\nelse {\n    // Ambil Start Index dari Binary Parser (agar sumbu X jalan terus 100, 101...)\n    var startIndex = msg.start_index; \n    if (startIndex === undefined) startIndex = 0;\n\n    labels = [];\n    values = inputData;\n\n    // Buat label urut (Continuous Counter)\n    for(var i=0; i<inputData.length; i++) {\n        labels.push(startIndex + i);\n    }\n\n    outputMsg.topic = \"APPEND_DATA\";\n    outputMsg.payload = { \n        data: values,\n        labels: labels \n    };\n    return outputMsg;\n}",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1130,
+        "y": 700,
+        "wires": [
+            [
+                "ec6a6ec71c493546"
+            ]
+        ]
+    },
+    {
+        "id": "btn_calc_fft",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "Hitung FFT",
+        "group": "grp_visual",
+        "order": 3,
+        "width": 4,
+        "height": 1,
+        "passthru": false,
+        "label": "HITUNG FFT (DATA TERAKHIR)",
+        "tooltip": "Analisis spektrum dari data database",
+        "color": "white",
+        "bgcolor": "#D84315",
+        "className": "",
+        "icon": "fa-bar-chart",
+        "payload": "CALC",
+        "payloadType": "str",
+        "topic": "trigger_fft",
+        "topicType": "str",
+        "x": 120,
+        "y": 780,
+        "wires": [
+            [
+                "func_build_fft_query"
+            ]
+        ]
+    },
+    {
+        "id": "func_build_fft_query",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Build FFT Query",
+        "func": "// BUILD QUERY (Session Filter)\nvar selectedNode = global.get('selected_view_node');\nif (!selectedNode) {\n    node.warn(\"Pilih Node dulu\");\n    return null;\n}\n\nvar sessionStartMs = global.get('session_t0_' + selectedNode);\nvar query = \"\";\n\nif (sessionStartMs) {\n    // Ambil data sesi ini saja\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' AND time >= ${sessionStartMs}ms ORDER BY time ASC`;\n} else {\n    // Fallback\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' ORDER BY time DESC LIMIT 1000`;\n}\n\nmsg.query = query;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 320,
+        "y": 780,
+        "wires": [
+            [
+                "influx_read_fft"
+            ]
+        ]
+    },
+    {
+        "id": "influx_read_fft",
+        "type": "influxdb in",
+        "z": "4b0d46176830263d",
+        "influxdb": "conf_influx",
+        "name": "Read DB",
+        "query": "",
+        "rawOutput": false,
+        "precision": "",
+        "retentionPolicy": "",
+        "org": "organisation",
+        "x": 490,
+        "y": 780,
+        "wires": [
+            [
+                "func_prep_py_fft"
+            ]
+        ]
+    },
+    {
+        "id": "func_prep_py_fft",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Format Array",
+        "func": "var data = msg.payload;\nif (!Array.isArray(data) || data.length === 0) return null;\n\nvar values = [];\n// Ganti jadi loop MAJU (i++)\nfor (var i = 0; i < data.length; i++) {\n    values.push(data[i].amplitude);\n}\n\n// Kirim sebagai JSON String ke Python\nmsg.payload = JSON.stringify(values);\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 660,
+        "y": 780,
+        "wires": [
+            [
+                "exec_py_fft"
+            ]
+        ]
+    },
+    {
+        "id": "exec_py_fft",
+        "type": "exec",
+        "z": "4b0d46176830263d",
+        "command": "python3 /data/seismic_calc.py",
+        "addpay": true,
+        "append": "",
+        "useSpawn": "false",
+        "timer": "",
+        "oldrc": false,
+        "name": "Run Python",
+        "x": 860,
+        "y": 780,
+        "wires": [
+            [
+                "func_fft_formatter"
+            ],
+            [],
+            []
+        ]
+    },
+    {
+        "id": "func_fft_formatter",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "FFT Formatter (JS)",
+        "func": "try {\n    var result = JSON.parse(msg.payload);\n    \n    if (result.status === \"OK\" && result.fft) {\n        var labels = [];\n        var values = [];\n        \n        // Pisahkan X (Freq) dan Y (Amp) untuk Chart.js\n        for(var i=0; i<result.fft.length; i++) {\n            labels.push(result.fft[i].x);\n            values.push(result.fft[i].y);\n        }\n        \n        msg.payload = {\n            labels: labels,\n            data: values\n        };\n        msg.topic = \"UPDATE_FFT\";\n        return msg;\n    }\n} catch(e) { \n    node.warn(\"Error Parse Python: \" + e);\n    return null; \n}\nreturn null;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1080,
+        "y": 780,
+        "wires": [
+            [
+                "template_fft_chart"
+            ]
+        ]
+    },
+    {
+        "id": "template_fft_chart",
+        "type": "ui_template",
+        "z": "4b0d46176830263d",
+        "group": "grp_visual",
+        "name": "FFT Chart (JS)",
+        "order": 12,
+        "width": 30,
+        "height": 6,
+        "format": "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\n\n<div style=\"position: relative; height: 100%; width: 100%; padding: 5px;\">\n    <canvas id=\"fftChart\"></canvas>\n</div>\n\n<script>\n(function(scope) {\n    var fftChart = null;\n\n    function initFFT() {\n        var ctx = document.getElementById('fftChart').getContext('2d');\n        \n        if (fftChart) fftChart.destroy();\n\n        fftChart = new Chart(ctx, {\n            type: 'bar', // Bar chart lebih cocok untuk spektrum diskrit\n            data: {\n                labels: [],\n                datasets: [{\n                    label: 'Spektrum Frekuensi (Post-Process)',\n                    data: [],\n                    backgroundColor: 'rgba(216, 67, 21, 0.6)', // Warna Oranye Transparan\n                    borderColor: '#D84315',\n                    borderWidth: 1,\n                    barPercentage: 1.0,\n                    categoryPercentage: 1.0\n                }]\n            },\n            options: {\n                responsive: true,\n                maintainAspectRatio: false,\n                animation: {\n                    duration: 800 // Animasi halus saat load pertama\n                },\n                scales: {\n                    x: {\n                        title: { display: true, text: 'Frekuensi (Hz)' },\n                        ticks: {\n                            autoSkip: true,\n                            maxTicksLimit: 20\n                        }\n                    },\n                    y: {\n                        title: { display: true, text: 'Magnitudo' },\n                        beginAtZero: true\n                    }\n                }\n            }\n        });\n    }\n\n    // Init awal setelah delay agar DOM siap\n    setTimeout(initFFT, 500);\n\n    scope.$watch('msg', function(msg) {\n        if (!msg || msg.topic !== \"UPDATE_FFT\") return;\n        \n        if (!fftChart) initFFT();\n        \n        // Ganti total data\n        fftChart.data.labels = msg.payload.labels;\n        fftChart.data.datasets[0].data = msg.payload.data;\n        fftChart.update();\n    });\n})(scope);\n</script>",
+        "storeOutMessages": false,
+        "fwdInMessages": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1290,
+        "y": 780,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "node_prog_logic",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Hitung Progress",
+        "func": "// LOGIKA PROGRESS BAR (Kalibrasi 50 Sampel/Paket)\n\n// Total Sampel: 500 (5 detik)\n// Per Paket: 50 Sampel (sesuai debug)\n// Total Paket: 500 / 50 = 10\nvar totalPackets = 34; \n\nvar currentCount = flow.get('pkg_count') || 0;\n\n// 1. Trigger Reset (Dari Tombol Global ACQ)\n// Topik bisa 'trigger_acq' atau 'RESET_PROGRESS' tergantung node sebelumnya\nif (msg.topic === \"trigger_acq\" || msg.topic === \"RESET_PROGRESS\") {\n    flow.set('pkg_count', 0);\n    return { payload: 0, topic: \"Menunggu...\" };\n}\n\n// 2. Hitung Progress (Dari Data Masuk)\n// Pastikan hanya menghitung jika payload adalah array data seismik\nif (Array.isArray(msg.payload) && msg.payload.length > 0) {\n    currentCount++;\n    flow.set('pkg_count', currentCount);\n    \n    // Hitung Persentase\n    var percent = Math.round((currentCount / totalPackets) * 100);\n    \n    // Safety Cap\n    if (percent > 100) percent = 100;\n    \n    msg.payload = percent;\n    msg.topic = \"Menerima: \" + currentCount + \"/\" + totalPackets + \" pkt\";\n    \n    return msg;\n}\n\nreturn null; // Abaikan pesan lain",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 910,
+        "y": 240,
+        "wires": [
+            [
+                "node_ui_gauge"
+            ]
+        ]
+    },
+    {
+        "id": "node_ui_gauge",
+        "type": "ui_gauge",
+        "z": "4b0d46176830263d",
+        "name": "Loading Data",
+        "group": "grp_visual",
+        "order": 1,
+        "width": "8",
+        "height": "2",
+        "gtype": "gage",
+        "title": "Status Penerimaan Data",
+        "label": "%",
+        "format": "{{value}}%",
+        "min": 0,
+        "max": 100,
+        "colors": [
+            "#e74c3c",
+            "#f1c40f",
+            "#3498db"
+        ],
+        "seg1": "",
+        "seg2": "",
+        "diff": false,
+        "className": "",
+        "x": 1110,
+        "y": 240,
+        "wires": []
+    },
+    {
+        "id": "node_btn_plot_now",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "Plot Sekarang",
+        "group": "grp_visual",
+        "order": 2,
+        "width": "4",
+        "height": "2",
+        "passthru": false,
+        "label": "REFRESH PLOT (LAST DATA)",
+        "tooltip": "Ambil data dari database dan tampilkan",
+        "color": "white",
+        "bgcolor": "#1f77b4",
+        "className": "",
+        "icon": "fa-refresh",
+        "payload": "REFRESH",
+        "payloadType": "str",
+        "topic": "",
+        "topicType": "str",
+        "x": 430,
+        "y": 640,
+        "wires": [
+            [
+                "node_qry_hist"
+            ]
+        ]
+    },
+    {
+        "id": "node_trig_plot_open",
+        "type": "ui_ui_control",
+        "z": "4b0d46176830263d",
+        "name": "Trigger: On Plot Open",
+        "events": "change",
+        "x": 150,
+        "y": 700,
+        "wires": [
+            [
+                "node_chk_tab"
+            ]
+        ]
+    },
+    {
+        "id": "node_chk_tab",
+        "type": "switch",
+        "z": "4b0d46176830263d",
+        "name": "Is Plot Tab?",
+        "property": "payload.tab",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "eq",
+                "v": "PLOT & ANALISIS",
+                "vt": "str"
+            }
+        ],
+        "checkall": "true",
+        "repair": false,
+        "outputs": 1,
+        "x": 340,
+        "y": 700,
+        "wires": [
+            [
+                "node_qry_hist"
+            ]
+        ]
+    },
+    {
+        "id": "node_qry_hist",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Build History Query",
+        "func": "// BUILD QUERY (Session Filter)\nvar selectedNode = global.get('selected_view_node');\nif (!selectedNode) {\n    node.warn(\"Pilih Node dulu\");\n    return null;\n}\n\nvar sessionStartMs = global.get('session_t0_' + selectedNode);\nvar query = \"\";\n\nif (sessionStartMs) {\n    // Ambil data sesi ini saja\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' AND time >= ${sessionStartMs}ms ORDER BY time ASC`;\n} else {\n    // Fallback\n    query = `SELECT amplitude FROM seismic_raw WHERE \"node_id\" = '${selectedNode}' ORDER BY time DESC LIMIT 1000`;\n}\n\nmsg.query = query;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 530,
+        "y": 700,
+        "wires": [
+            [
+                "node_read_hist"
+            ]
+        ]
+    },
+    {
+        "id": "node_read_hist",
+        "type": "influxdb in",
+        "z": "4b0d46176830263d",
+        "influxdb": "conf_influx",
+        "name": "Fetch History",
+        "query": "",
+        "rawOutput": false,
+        "precision": "",
+        "retentionPolicy": "",
+        "org": "organisation",
+        "x": 740,
+        "y": 640,
+        "wires": [
+            [
+                "node_fmt_hist"
+            ]
+        ]
+    },
+    {
+        "id": "node_fmt_hist",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "Format History",
+        "func": "// FORMAT HISTORY (Fixed & Optimized)\n// Mencegah Crash akibat Loop ganda\n\nvar data = msg.payload;\n\n// 1. Validasi\nif (!Array.isArray(data) || data.length === 0) {\n    return null;\n}\n\n// 2. Transformasi Data (Mapping)\n// Kita gunakan method .map() yang jauh lebih cepat dan aman daripada for-loop manual\n// Karena Query SQL sudah \"ORDER BY time ASC\", urutannya sudah benar.\n\nvar chartData = data.map(function (row) {\n    return {\n        x: new Date(row.time).getTime(), // Konversi ISO String ke Epoch MS\n        y: row.amplitude                 // Nilai Amplitudo\n    };\n});\n\n// 3. Output\n// Bungkus dalam array lagi sesuai standar Chart.js wrapper kita\nmsg.payload = [chartData];\nmsg.topic = \"HISTORY_REPLAY\";\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 910,
+        "y": 700,
+        "wires": [
+            [
+                "101677531990619f"
+            ]
+        ]
+    },
+    {
+        "id": "btn_reset_list",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "Reset Daftar",
+        "group": "grp_control",
+        "order": 10,
+        "width": "2",
+        "height": "1",
+        "passthru": false,
+        "label": "",
+        "tooltip": "Hapus daftar node (Reset Memori)",
+        "color": "white",
+        "bgcolor": "#D32F2F",
+        "className": "",
+        "icon": "fa-trash",
+        "payload": "RESET",
+        "payloadType": "str",
+        "topic": "reset",
+        "topicType": "str",
+        "x": 110,
+        "y": 280,
+        "wires": [
+            [
+                "node_clear_global"
+            ]
+        ]
+    },
+    {
+        "id": "node_clear_global",
+        "type": "change",
+        "z": "4b0d46176830263d",
+        "name": "Clear Global",
+        "rules": [
+            {
+                "t": "set",
+                "p": "seiscatch_status",
+                "pt": "global",
+                "to": "{}",
+                "tot": "json"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 300,
+        "y": 280,
+        "wires": [
+            [
+                "416a3f916355ab56"
+            ]
+        ]
+    },
+    {
+        "id": "25bb5008683b9f77",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "SMART ACQ",
+        "group": "grp_control",
+        "order": 1,
+        "width": "4",
+        "height": "1",
+        "passthru": false,
+        "label": "MULAI SIKLUS (SEQ)",
+        "tooltip": "Broadcast Schedule -> Tunggu -> Fetch Antrean",
+        "color": "white",
+        "bgcolor": "#D84315",
+        "className": "",
+        "icon": "fa-play-circle",
+        "payload": "START",
+        "payloadType": "str",
+        "topic": "trigger",
+        "topicType": "str",
+        "x": 130,
+        "y": 480,
+        "wires": [
+            [
+                "7a0f4daf45486882",
+                "a32aaeaf2b3d3ff5"
+            ]
+        ]
+    },
+    {
+        "id": "7a0f4daf45486882",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "1. Broadcast & Schedule",
+        "func": "// FASE 1: BROADCAST & RESET\n\n// A. Hitung Waktu Target\nvar delaySeconds = 5;\nvar targetTime = Math.floor(Date.now() / 1000) + delaySeconds;\n\n// Simpan ke Global\nglobal.set('acq_target_time', targetTime);\n\n// B. Siapkan Pesan Command (Output 1)\nvar cmdMsg = {\n    payload: \"<BROADCAST>ACQ_AT:\" + targetTime,\n    topic: \"seismic/downlink/\"\n};\n\n// C. Siapkan Pesan Reset (Output 2)\nvar resetMsg = {\n    topic: \"RESET_PROGRESS\",\n    payload: 0\n};\n\nnode.warn(\"Siklus Dimulai. Target: \" + targetTime);\n\n// Kirim ke masing-masing output\nreturn [cmdMsg, resetMsg];",
+        "outputs": 2,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 370,
+        "y": 480,
+        "wires": [
+            [
+                "58e0c4ebac0665ae"
+            ],
+            [
+                "node_prog_logic"
+            ]
+        ]
+    },
+    {
+        "id": "4d16f00a20031230",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "2. Buat Antrean Node",
+        "func": "// FASE 2: BUAT DAFTAR ANTRIAN\n\n// Ambil semua node yang pernah lapor diri\nvar statusMap = global.get('seiscatch_status') || {};\nvar nodeList = Object.keys(statusMap);\n\nif (nodeList.length === 0) {\n    node.warn(\"Tidak ada node aktif untuk di-fetch.\");\n    return null;\n}\n\nnode.warn(\"Mulai mengambil data dari: \" + JSON.stringify(nodeList));\n\n// Simpan antrean ke flow variable\nflow.set('fetch_queue', nodeList);\nflow.set('is_fetching', true);\n\n// Trigger loop pertama\nreturn { payload: \"NEXT\" };",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 740,
+        "y": 560,
+        "wires": [
+            [
+                "9ce57a79f8b1c2ce"
+            ]
+        ]
+    },
+    {
+        "id": "9ce57a79f8b1c2ce",
+        "type": "function",
+        "z": "4b0d46176830263d",
+        "name": "3. Fetch Dispatcher",
+        "func": "// FASE 3: LOOP PENGAMBILAN DATA\n\nvar queue = flow.get('fetch_queue') || [];\n\n// A. Cek jika antrean habis\nif (queue.length === 0) {\n    flow.set('is_fetching', false);\n    node.warn(\"Siklus Selesai. Semua node telah dipanggil.\");\n    global.set('global_command', 'STOP');\n    return null;\n}\n\n// B. Ambil Node ID berikutnya\nvar nextNode = queue.shift();\nflow.set('fetch_queue', queue);\n\nnode.warn(\"Memanggil Node: \" + nextNode);\n\n// C. Susun Pesan MQTT (Topik Umum, Payload Bertarget)\nvar mqttMsg = {\n    // Payload Bertarget (misal: <SEISMIC_NODE_001>FETCH)\n    payload: \"<\" + nextNode + \">FETCH\", \n    // Topik Umum (mematuhi hasil test: topic tanpa ID tambahan)\n    topic: \"seismic/downlink/\"\n};\n\n// Output Notifikasi UI\nvar uiMsg = { payload: \"Mengambil Data Node: \" + nextNode };\n\n// Output 1: Ke MQTT Out & Delay Loop\n// Output 2: Ke Notifikasi UI\nreturn [mqttMsg, uiMsg];",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1170,
+        "y": 440,
+        "wires": [
+            [
+                "58e0c4ebac0665ae",
+                "c4cc3a680d4ccd05",
+                "86ac066b26db17ac",
+                "e1e3a55fc83d061e"
+            ]
+        ]
+    },
+    {
+        "id": "c4cc3a680d4ccd05",
+        "type": "delay",
+        "z": "4b0d46176830263d",
+        "name": "Jeda Transfer (120s)",
+        "pauseType": "delay",
+        "timeout": "70",
+        "timeoutUnits": "seconds",
+        "rate": "1",
+        "nbRateUnits": "1",
+        "rateUnits": "second",
+        "randomFirst": "1",
+        "randomLast": "5",
+        "randomUnits": "seconds",
+        "drop": false,
+        "allowrate": false,
+        "outputs": 1,
+        "x": 1180,
+        "y": 560,
+        "wires": [
+            [
+                "9ce57a79f8b1c2ce"
+            ]
+        ]
+    },
+    {
+        "id": "58e0c4ebac0665ae",
+        "type": "link out",
+        "z": "4b0d46176830263d",
+        "name": "To MQTT Out",
+        "mode": "link",
+        "links": [
+            "6ad470e8181e4722"
+        ],
+        "x": 475,
+        "y": 400,
+        "wires": []
+    },
+    {
+        "id": "6ad470e8181e4722",
+        "type": "link in",
+        "z": "4b0d46176830263d",
+        "name": "link in 1",
+        "links": [
+            "58e0c4ebac0665ae"
+        ],
+        "x": 545,
+        "y": 400,
+        "wires": [
+            [
+                "5689ac759f6f5649"
+            ]
+        ]
+    },
+    {
+        "id": "86ac066b26db17ac",
+        "type": "debug",
+        "z": "4b0d46176830263d",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 990,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "a32aaeaf2b3d3ff5",
+        "type": "delay",
+        "z": "4b0d46176830263d",
+        "name": "Tunggu Fase Rekam (60s)",
+        "pauseType": "delay",
+        "timeout": "20",
+        "timeoutUnits": "seconds",
+        "rate": "1",
+        "nbRateUnits": "1",
+        "rateUnits": "second",
+        "randomFirst": "1",
+        "randomLast": "5",
+        "randomUnits": "seconds",
+        "drop": false,
+        "allowrate": false,
+        "outputs": 1,
+        "x": 380,
+        "y": 560,
+        "wires": [
+            [
+                "4d16f00a20031230"
+            ]
+        ]
+    },
+    {
+        "id": "b514e271aee61785",
+        "type": "debug",
+        "z": "4b0d46176830263d",
+        "name": "debug 3",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 210,
+        "y": 340,
+        "wires": []
+    },
+    {
+        "id": "2a326a14d5f2da7b",
+        "type": "ui_text_input",
+        "z": "4b0d46176830263d",
+        "name": "Input Jarak",
+        "label": "Jarak Baru (m):",
+        "tooltip": "Ketik jarak lalu tekan Enter/Tab",
+        "group": "grp_experiment",
+        "passthru": true,
+        "mode": "text",
+        "delay": 0,
+        "topic": "distance",
+        "topicType": "str",
+        "x": 110,
+        "y": 980,
+        "wires": [
+            [
+                "07a2c9de04d8a569"
+            ]
+        ]
+    },
+    {
+        "id": "07a2c9de04d8a569",
+        "type": "change",
+        "z": "4b0d46176830263d",
+        "name": "Simpan ke Memori",
+        "rules": [
+            {
+                "t": "set",
+                "p": "experiment_distance",
+                "pt": "global",
+                "to": "payload",
+                "tot": "msg"
+            }
+        ],
+        "action": "",
+        "property": "",
+        "from": "",
+        "to": "",
+        "reg": false,
+        "x": 330,
+        "y": 980,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "ef4ad2982a0c8837",
+        "type": "ui_button",
+        "z": "4b0d46176830263d",
+        "name": "SET JARAK",
+        "group": "grp_experiment",
+        "order": 2,
+        "width": "3",
+        "height": "1",
+        "passthru": false,
+        "label": "UPDATE",
+        "tooltip": "Kirim jarak tersimpan ke Python",
+        "color": "white",
+        "bgcolor": "#d32f2f",
+        "className": "",
+        "icon": "fa-map-marker",
+        "payload": "experiment_distance",
+        "payloadType": "global",
+        "topic": "experiment/set_distance",
+        "topicType": "str",
+        "x": 110,
+        "y": 1040,
+        "wires": [
+            [
+                "a2fbb7fc1eb818be",
+                "ed0a4579cbc29ae9"
+            ]
+        ]
+    },
+    {
+        "id": "a2fbb7fc1eb818be",
+        "type": "mqtt out",
+        "z": "4b0d46176830263d",
+        "name": "Ke Python Sniffer",
+        "topic": "",
+        "qos": "0",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "brk_mosquitto",
+        "x": 330,
+        "y": 1040,
+        "wires": []
+    },
+    {
+        "id": "ed0a4579cbc29ae9",
+        "type": "ui_text",
+        "z": "4b0d46176830263d",
+        "group": "grp_experiment",
+        "order": 3,
+        "width": "6",
+        "height": "1",
+        "name": "",
+        "label": "Jarak Tercatat:",
+        "format": "{{msg.payload}} meter",
+        "layout": "row-spread",
+        "className": "",
+        "x": 340,
+        "y": 1100,
+        "wires": []
+    },
+    {
+        "id": "5a885f6c9a83903b",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 7,
+        "width": 12,
+        "height": 1
+    },
+    {
+        "id": "ca755c36f69e6c8b",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 9,
+        "width": 11,
+        "height": 1
+    },
+    {
+        "id": "51d7f46d513083a7",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_visual",
+        "order": 11,
+        "width": 30,
+        "height": 1
+    },
+    {
+        "id": "956c310773eba86e",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 2,
+        "width": 25,
+        "height": 1
+    },
+    {
+        "id": "7f49876382ef9d92",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 3,
+        "width": 25,
+        "height": 1
+    },
+    {
+        "id": "eb39ce333e9d1850",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 6,
+        "width": 24,
+        "height": 1
+    },
+    {
+        "id": "0145663df3d8fd4e",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 7,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "ef405c4207a655a7",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 9,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "3f2b74d54e5a5652",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 10,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "3aa8e8cc8f3c3bdd",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 11,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "be33b6cc3a7d3c4b",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 12,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "769ee686ed487ff6",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 13,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "820055f5b5526d22",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 14,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "d59bf738461a1dcc",
+        "type": "ui_spacer",
+        "z": "4b0d46176830263d",
+        "name": "spacer",
+        "group": "grp_control",
+        "order": 15,
+        "width": 4,
+        "height": 1
+    },
+    {
+        "id": "brk_mosquitto",
+        "type": "mqtt-broker",
+        "name": "Local Broker",
+        "broker": "mosquitto",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "grp_visual",
+        "type": "ui_group",
+        "name": "VISUALISASI & ANALISIS",
+        "tab": "930c653161f1a129",
+        "order": 2,
+        "disp": true,
+        "width": 30,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "conf_influx",
+        "type": "influxdb",
+        "hostname": "influxdb",
+        "port": "8086",
+        "protocol": "http",
+        "database": "seismic_data",
+        "name": "Seismic DB",
+        "usetls": false,
+        "tls": "",
+        "influxdbVersion": "1.x",
+        "url": "http://localhost:8086",
+        "timeout": "",
+        "rejectUnauthorized": true
+    },
+    {
+        "id": "grp_control",
+        "type": "ui_group",
+        "name": "SOH & KONTROL",
+        "tab": "tab_dashboard",
+        "order": 1,
+        "disp": true,
+        "width": 30,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "grp_experiment",
+        "type": "ui_group",
+        "name": "KONTROL EKSPERIMEN (FIELD TEST)",
+        "tab": "tab_dashboard",
+        "order": 10,
+        "disp": true,
+        "width": "6",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "930c653161f1a129",
+        "type": "ui_tab",
+        "name": "PLOT & ANALISIS",
+        "icon": "fa-area-chart",
+        "order": 2,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "tab_dashboard",
+        "type": "ui_tab",
+        "name": "Dashboard Utama",
+        "icon": "dashboard",
+        "order": 1,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "7dd945490d6a8499",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6",
+            "node-red-contrib-influxdb": "0.7.0"
+        }
+    }
+]
